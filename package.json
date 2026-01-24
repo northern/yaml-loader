@@ -1,7 +1,7 @@
 {
   "name": "@northern/yaml-loader",
   "version": "1.0.3",
-  "description": "Load YAML files from fragment sources",
+  "description": "Load YAML files from fragmented sources",
   "main": "lib/index.js",
   "files": [
     "lib/**/*"
