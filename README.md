@@ -40,13 +40,11 @@ The YAML loader module provides:
 - **Debugging**: Comprehensive debug information and error reporting
 - **Extensibility**: Custom resolver plugin system
 
-## Installation
+## Basic Usage
 
 ```typescript
-import { loadYaml, YamlLoaderBuilder, YamlLoaderError } from './yaml-loader';
+import loadYaml from '@northern/yaml-loader';
 ```
-
-## Basic Usage
 
 ### Simple YAML Loading
 
