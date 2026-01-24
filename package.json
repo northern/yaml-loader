@@ -1,0 +1,44 @@
+{
+  "name": "@northern/yaml-loader",
+  "version": "1.0.0",
+  "description": "Load YAML files from fragment sources",
+  "main": "lib/index.js",
+  "files": [
+    "lib/**/*"
+  ],
+  "scripts": {
+    "build": "tsc --removeComments",
+    "test": "jest",
+    "test:watch": "jest --watch --no-coverage",
+    "test:coverage": "jest --coverage",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/northern/yaml-loader.git"
+  },
+  "keywords": [
+    "di",
+    "dependency injection",
+    "inversion of control",
+    "library"
+  ],
+  "author": "northern",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/northern/yaml-loader/issues"
+  },
+  "homepage": "https://github.com/northern/yaml-loader#readme",
+  "devDependencies": {
+    "@types/jest": "^29",
+    "@types/uuid": "^9",
+    "@types/yaml": "^1.9.6",
+    "jest": "^29",
+    "ts-jest": "^29",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "yaml": "^2.8.2"
+  }
+}
