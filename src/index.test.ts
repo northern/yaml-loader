@@ -6,7 +6,7 @@ import {
   YamlLoaderError,
   YamlLoaderOptions,
   getTestCacheInterface,
-} from './yaml-loader';
+} from '.';
 import { writeFileSync, mkdirSync, rmSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { tmpdir } from 'os';
@@ -963,7 +963,7 @@ version: 1.0
 
     it('should work with default export', () => {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const yamlLoader = require('./yaml-loader').default;
+      const yamlLoader = require('./index').default;
       const filePath = writeTestFile('default-export.yaml', `
 name: default-export-test
 `);
@@ -1046,7 +1046,7 @@ data:
       const mockError = new Error('Unexpected error');
 
       // Temporarily override to test error handling
-      const originalModule = await import('./yaml-loader');
+      const originalModule = await import('./index');
 
       try {
         // This will pass normally
