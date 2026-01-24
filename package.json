@@ -19,11 +19,14 @@
     "url": "git+https://github.com/northern/yaml-loader.git"
   },
   "keywords": [
-    "di",
-    "dependency injection",
-    "inversion of control",
+    "yaml",
+    "loading",
+    "openapi",
     "library"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "northern",
   "license": "MIT",
   "bugs": {
