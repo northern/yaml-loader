@@ -2,12 +2,32 @@
   "name": "@northern/yaml-loader",
   "version": "1.0.4",
   "description": "Load YAML files from fragmented sources",
-  "main": "lib/index.js",
+  "main": "lib/cjs/index.js",
+  "module": "lib/esm/index.js",
+  "types": "lib/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./lib/esm/index.d.ts",
+        "default": "./lib/esm/index.js"
+      },
+      "require": {
+        "types": "./lib/cjs/index.d.ts",
+        "default": "./lib/cjs/index.js"
+      }
+    }
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=16.0.0"
+  },
   "files": [
     "lib/**/*"
   ],
   "scripts": {
-    "build": "tsc --removeComments",
+    "build": "npm run build:cjs && npm run build:esm",
+    "build:cjs": "tsc -p tsconfig.cjs.json --removeComments",
+    "build:esm": "tsc -p tsconfig.esm.json --removeComments",
     "test": "jest",
     "test:watch": "jest --watch --no-coverage",
     "test:coverage": "jest --coverage",
