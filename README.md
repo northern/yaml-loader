@@ -6,11 +6,11 @@ A comprehensive utility for loading and parsing YAML/JSON files with advanced `$
 
 Install with NPM:
 
-    npm install @northern/di
+    npm install @northern/yaml-loader
 
 or Yarn:
 
-    yarn add @northern/di
+    yarn add @northern/yaml-loader
 
 ## Table of Contents
 
