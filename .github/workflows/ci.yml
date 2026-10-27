@@ -8,17 +8,23 @@ on:
 
 jobs:
   test:
-    name: Test suite
+    name: Test suite (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [ '18', '20', '22', '24' ]
 
     steps:
       - name: Clone repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v5
 
       - name: Set up NodeJs
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v5
         with:
-          node-version: '22'
+          node-version: ${{ matrix.node-version }}
+          cache: npm
 
-      - run: npm install
-      - run: npm run test
+      - run: npm ci
+      - run: npm run build
+      - run: npm test

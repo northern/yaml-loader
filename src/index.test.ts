@@ -5,31 +5,48 @@ import {
   YamlLoaderBuilder,
   YamlLoaderError,
   YamlLoaderOptions,
-  getTestCacheInterface,
 } from '.';
-import { writeFileSync, mkdirSync, rmSync, readFileSync } from 'fs';
-import { join, dirname } from 'path';
+import fs, { writeFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'fs';
+import { join, dirname, relative } from 'path';
 import { tmpdir } from 'os';
 
 describe('yaml-loader', () => {
-  const testDir = join(tmpdir(), 'yaml-loader-test-' + Date.now());
+  let testDir: string;
+  let caseDir: string;
 
   beforeAll(() => {
-    mkdirSync(testDir, { recursive: true });
+    testDir = mkdtempSync(join(tmpdir(), 'yaml-loader-test-'));
   });
 
   afterAll(() => {
     rmSync(testDir, { recursive: true, force: true });
   });
 
+  beforeEach(() => {
+    // Every test gets its own directory so fixtures can't leak between tests
+    caseDir = mkdtempSync(join(testDir, 'case-'));
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
   const writeTestFile = (filename: string, content: string): string => {
-    const filePath = join(testDir, filename);
-    const dir = join(testDir, ...filename.split('/').slice(0, -1));
-    if (dir !== testDir) {
-      mkdirSync(dir, { recursive: true });
-    }
+    const filePath = join(caseDir, filename);
+    mkdirSync(dirname(filePath), { recursive: true });
     writeFileSync(filePath, content);
     return filePath;
+  };
+
+  const catchError = (fn: () => unknown): YamlLoaderError => {
+    try {
+      fn();
+    }
+    catch (error) {
+      expect(error).toBeInstanceOf(YamlLoaderError);
+      return error as YamlLoaderError;
+    }
+    throw new Error('Expected function to throw');
   };
 
   describe('basic YAML loading', () => {
@@ -71,8 +88,58 @@ items:
 
     it('should return null for empty YAML file', () => {
       const filePath = writeTestFile('empty.yaml', '');
-      const result = loadYaml(filePath);
-      expect(result).toBeNull();
+      expect(loadYaml(filePath)).toBeNull();
+    });
+
+    it('should return null for YAML files with only comments', () => {
+      const filePath = writeTestFile('comments-only.yaml', '# This is a comment\n# Another comment');
+      expect(loadYaml(filePath)).toBeNull();
+    });
+
+    it('should load JSON files', () => {
+      const filePath = writeTestFile('empty.json', '{}');
+      expect(loadYaml(filePath)).toEqual({});
+    });
+
+    it('should handle primitive values correctly', () => {
+      const filePath = writeTestFile('primitives.yaml', `
+string: hello
+number: 42
+float: 3.14
+boolean: true
+nullValue: null
+`);
+      expect(loadYaml(filePath)).toEqual({
+        string: 'hello',
+        number: 42,
+        float: 3.14,
+        boolean: true,
+        nullValue: null,
+      });
+    });
+
+    it('should accept a path relative to the working directory', () => {
+      writeTestFile('relative-target.yaml', 'value: resolved');
+      const filePath = writeTestFile('relative-main.yaml', `
+data:
+  $ref: "./relative-target.yaml"
+`);
+      const result = loadYaml(relative(process.cwd(), filePath));
+      expect(result).toEqual({ data: { value: 'resolved' } });
+    });
+
+    it('should keep "__proto__" keys as data without changing the prototype', () => {
+      const jsonPath = writeTestFile('proto.json', '{"__proto__": {"polluted": true}, "a": 1}');
+      const fromJson = loadYaml(jsonPath);
+      expect(Object.keys(fromJson)).toEqual(['__proto__', 'a']);
+      expect(Object.getPrototypeOf(fromJson)).toBe(Object.prototype);
+      expect(fromJson.polluted).toBeUndefined();
+
+      const yamlPath = writeTestFile('proto.yaml', '__proto__:\n  polluted: true\n');
+      const fromYaml = loadYaml(yamlPath);
+      expect(Object.getPrototypeOf(fromYaml)).toBe(Object.prototype);
+      expect(fromYaml.polluted).toBeUndefined();
+      expect(({} as any).polluted).toBeUndefined();
     });
   });
 
@@ -108,14 +175,8 @@ user:
 definitions:
   Address:
     type: object
-    properties:
-      street:
-        type: string
   Person:
-    type: object
-    properties:
-      name:
-        type: string
+    type: string
 homeAddress:
   $ref: "#/definitions/Address"
 workAddress:
@@ -124,30 +185,9 @@ owner:
   $ref: "#/definitions/Person"
 `);
       const result = loadYaml(filePath);
-      expect(result).toEqual({
-        definitions: {
-          Address: {
-            type: 'object',
-            properties: { street: { type: 'string' } },
-          },
-          Person: {
-            type: 'object',
-            properties: { name: { type: 'string' } },
-          },
-        },
-        homeAddress: {
-          type: 'object',
-          properties: { street: { type: 'string' } },
-        },
-        workAddress: {
-          type: 'object',
-          properties: { street: { type: 'string' } },
-        },
-        owner: {
-          type: 'object',
-          properties: { name: { type: 'string' } },
-        },
-      });
+      expect(result.homeAddress).toEqual({ type: 'object' });
+      expect(result.workAddress).toEqual({ type: 'object' });
+      expect(result.owner).toEqual({ type: 'string' });
     });
 
     it('should resolve nested internal $refs', () => {
@@ -164,28 +204,9 @@ user:
   $ref: "#/definitions/User"
 `);
       const result = loadYaml(filePath);
-      expect(result).toEqual({
-        definitions: {
-          Name: {
-            type: 'string',
-          },
-          User: {
-            type: 'object',
-            properties: {
-              name: {
-                type: 'string',
-              },
-            },
-          },
-        },
-        user: {
-          type: 'object',
-          properties: {
-            name: {
-              type: 'string',
-            },
-          },
-        },
+      expect(result.user).toEqual({
+        type: 'object',
+        properties: { name: { type: 'string' } },
       });
     });
 
@@ -198,8 +219,7 @@ items:
 selected:
   $ref: "#/items/1"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
+      expect(loadYaml(filePath)).toEqual({
         items: ['first', 'second', 'third'],
         selected: 'second',
       });
@@ -215,21 +235,39 @@ definitions:
 item:
   $ref: "#/definitions/A"
 `);
-      expect(() => loadYaml(filePath)).toThrow(/Circular reference detected/);
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('circular_ref');
+      expect(error.message).toMatch(/Circular reference detected/);
+    });
+
+    it('should not report a cycle when two files use the same internal pointer', () => {
+      writeTestFile('other.yaml', `
+value:
+  $ref: "#/defs/X"
+defs:
+  X:
+    ok: true
+`);
+      const filePath = writeTestFile('main.yaml', `
+item:
+  $ref: "#/defs/X"
+defs:
+  X:
+    $ref: "./other.yaml"
+`);
+      const result = loadYaml(filePath);
+      expect(result.item.value).toEqual({ ok: true });
     });
   });
 
   describe('$ref resolution - external files', () => {
     it('should resolve a $ref to another YAML file', () => {
-      writeTestFile('referenced.yaml', `
-message: Hello from referenced file
-`);
+      writeTestFile('referenced.yaml', 'message: Hello from referenced file');
       const filePath = writeTestFile('main.yaml', `
 data:
   $ref: "./referenced.yaml"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
+      expect(loadYaml(filePath)).toEqual({
         data: { message: 'Hello from referenced file' },
       });
     });
@@ -240,8 +278,7 @@ data:
 config:
   $ref: "./data.json"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
+      expect(loadYaml(filePath)).toEqual({
         config: { count: 42, active: true },
       });
     });
@@ -251,21 +288,12 @@ config:
 definitions:
   User:
     type: object
-    properties:
-      name:
-        type: string
 `);
       const filePath = writeTestFile('schema.yaml', `
 user:
   $ref: "./definitions.yaml#/definitions/User"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        user: {
-          type: 'object',
-          properties: { name: { type: 'string' } },
-        },
-      });
+      expect(loadYaml(filePath)).toEqual({ user: { type: 'object' } });
     });
 
     it('should resolve a $ref to a deeply nested path', () => {
@@ -279,18 +307,35 @@ level1:
 result:
   $ref: "./deep.yaml#/level1/level2/level3"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        result: { value: 'deep value' },
-      });
+      expect(loadYaml(filePath)).toEqual({ result: { value: 'deep value' } });
+    });
+
+    it('should resolve a $ref at the document root', () => {
+      writeTestFile('root-target.yaml', 'value: default');
+      const filePath = writeTestFile('root-level-ref.yaml', '$ref: "./root-target.yaml"');
+      expect(loadYaml(filePath)).toEqual({ value: 'default' });
+    });
+
+    it('should resolve internal refs inside a referenced file against that file', () => {
+      writeTestFile('lib.yaml', `
+exported:
+  $ref: "#/private"
+private:
+  secret: from-lib
+`);
+      const filePath = writeTestFile('consumer.yaml', `
+private:
+  secret: from-consumer
+data:
+  $ref: "./lib.yaml#/exported"
+`);
+      expect(loadYaml(filePath).data).toEqual({ secret: 'from-lib' });
     });
   });
 
   describe('$ref resolution - nested references', () => {
     it('should resolve nested $ref references', () => {
-      writeTestFile('level2.yaml', `
-finalValue: nested reference resolved
-`);
+      writeTestFile('level2.yaml', 'finalValue: nested reference resolved');
       writeTestFile('level1.yaml', `
 nested:
   $ref: "./level2.yaml"
@@ -299,72 +344,68 @@ nested:
 data:
   $ref: "./level1.yaml"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        data: {
-          nested: { finalValue: 'nested reference resolved' },
-        },
+      expect(loadYaml(filePath)).toEqual({
+        data: { nested: { finalValue: 'nested reference resolved' } },
       });
     });
 
     it('should resolve multiple $ref references at the same level', () => {
-      writeTestFile('ref-a.yaml', `
-valueA: A
-`);
-      writeTestFile('ref-b.yaml', `
-valueB: B
-`);
+      writeTestFile('ref-a.yaml', 'valueA: A');
+      writeTestFile('ref-b.yaml', 'valueB: B');
       const filePath = writeTestFile('multi-ref.yaml', `
 partA:
   $ref: "./ref-a.yaml"
 partB:
   $ref: "./ref-b.yaml"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
+      expect(loadYaml(filePath)).toEqual({
         partA: { valueA: 'A' },
         partB: { valueB: 'B' },
       });
     });
 
     it('should resolve $ref in arrays', () => {
-      writeTestFile('array-item.yaml', `
-type: referenced
-`);
+      writeTestFile('array-item.yaml', 'type: referenced');
       const filePath = writeTestFile('array-ref.yaml', `
 items:
   - name: inline
   - $ref: "./array-item.yaml"
 `);
+      expect(loadYaml(filePath)).toEqual({
+        items: [{ name: 'inline' }, { type: 'referenced' }],
+      });
+    });
+
+    it('should allow sibling references to the same file', () => {
+      writeTestFile('sibling-shared.yaml', 'value: shared');
+      const filePath = writeTestFile('sibling-refs.yaml', `
+first:
+  $ref: "./sibling-shared.yaml"
+second:
+  $ref: "./sibling-shared.yaml"
+`);
       const result = loadYaml(filePath);
       expect(result).toEqual({
-        items: [
-          { name: 'inline' },
-          { type: 'referenced' },
-        ],
+        first: { value: 'shared' },
+        second: { value: 'shared' },
       });
+      // Each reference gets its own copy
+      expect(result.first).not.toBe(result.second);
     });
   });
 
   describe('$ref resolution - subdirectories', () => {
     it('should resolve $ref to files in subdirectories', () => {
-      writeTestFile('subdir/component.yaml', `
-name: SubdirComponent
-`);
+      writeTestFile('subdir/component.yaml', 'name: SubdirComponent');
       const filePath = writeTestFile('with-subdir.yaml', `
 component:
   $ref: "./subdir/component.yaml"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        component: { name: 'SubdirComponent' },
-      });
+      expect(loadYaml(filePath)).toEqual({ component: { name: 'SubdirComponent' } });
     });
 
     it('should resolve relative paths from referenced files', () => {
-      writeTestFile('nested/deep/final.yaml', `
-final: true
-`);
+      writeTestFile('nested/deep/final.yaml', 'final: true');
       writeTestFile('nested/middle.yaml', `
 ref:
   $ref: "./deep/final.yaml"
@@ -373,12 +414,20 @@ ref:
 data:
   $ref: "./nested/middle.yaml"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        data: {
-          ref: { final: true },
-        },
-      });
+      expect(loadYaml(filePath)).toEqual({ data: { ref: { final: true } } });
+    });
+
+    it('should allow a nested file to reference a sibling directory inside the root', () => {
+      writeTestFile('schemas/user.yaml', 'type: object');
+      writeTestFile('paths/users.yaml', `
+schema:
+  $ref: "../schemas/user.yaml"
+`);
+      const filePath = writeTestFile('api.yaml', `
+users:
+  $ref: "./paths/users.yaml"
+`);
+      expect(loadYaml(filePath)).toEqual({ users: { schema: { type: 'object' } } });
     });
   });
 
@@ -390,33 +439,40 @@ data:
 "a~b":
   value: tilded
 `);
-      const filePathSlash = writeTestFile('escaped-slash-ref.yaml', `
+      const slashPath = writeTestFile('escaped-slash-ref.yaml', `
 result:
   $ref: "./escaped.yaml#/a~1b"
 `);
-      const resultSlash = loadYaml(filePathSlash);
-      expect(resultSlash).toEqual({ result: { value: 'slashed' } });
+      expect(loadYaml(slashPath)).toEqual({ result: { value: 'slashed' } });
 
-      const filePathTilde = writeTestFile('escaped-tilde-ref.yaml', `
+      const tildePath = writeTestFile('escaped-tilde-ref.yaml', `
 result:
   $ref: "./escaped.yaml#/a~0b"
 `);
-      const resultTilde = loadYaml(filePathTilde);
-      expect(resultTilde).toEqual({ result: { value: 'tilded' } });
+      expect(loadYaml(tildePath)).toEqual({ result: { value: 'tilded' } });
+    });
+
+    it('should handle "#" and percent-encoding inside a pointer', () => {
+      writeTestFile('special-keys.yaml', `
+"a#b": hashed
+"a b": spaced
+`);
+      const filePath = writeTestFile('special-ref.yaml', `
+hash:
+  $ref: "./special-keys.yaml#/a#b"
+space:
+  $ref: "./special-keys.yaml#/a%20b"
+`);
+      expect(loadYaml(filePath)).toEqual({ hash: 'hashed', space: 'spaced' });
     });
 
     it('should handle $ref to root of file with empty pointer', () => {
-      writeTestFile('full-file.yaml', `
-key: value
-`);
+      writeTestFile('full-file.yaml', 'key: value');
       const filePath = writeTestFile('root-ref.yaml', `
 all:
   $ref: "./full-file.yaml#"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        all: { key: 'value' },
-      });
+      expect(loadYaml(filePath)).toEqual({ all: { key: 'value' } });
     });
 
     it('should handle $ref to array index', () => {
@@ -424,134 +480,119 @@ all:
 items:
   - first
   - second
-  - third
 `);
       const filePath = writeTestFile('array-index-ref.yaml', `
 second:
   $ref: "./with-array.yaml#/items/1"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({ second: 'second' });
+      expect(loadYaml(filePath)).toEqual({ second: 'second' });
+    });
+
+    it.each([
+      ['a missing nested path', './valid.yaml#/nonexistent/path'],
+      ['a missing final key', './valid.yaml#/existing/missing'],
+      ['a missing internal key', '#/nonexistent'],
+      ['a primitive traversal', './valid.yaml#/list/0/invalid'],
+      ['an out-of-range array index', './valid.yaml#/list/5'],
+      ['an array property', './valid.yaml#/list/length'],
+      ['an inherited property', '#/constructor'],
+      ['a pointer without a leading slash', './valid.yaml#existing'],
+    ])('should throw invalid_pointer for %s', (_name, ref) => {
+      writeTestFile('valid.yaml', `
+existing:
+  key: value
+list:
+  - first
+`);
+      const filePath = writeTestFile('invalid-pointer.yaml', `
+data:
+  $ref: "${ref}"
+`);
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('invalid_pointer');
+      expect(error.message).toMatch(/Cannot resolve pointer/);
     });
   });
 
   describe('error handling', () => {
     it('should throw error for circular references', () => {
-      writeTestFile('circular-a.yaml', `
-ref:
-  $ref: "./circular-b.yaml"
-`);
       writeTestFile('circular-b.yaml', `
 ref:
   $ref: "./circular-a.yaml"
 `);
-      const filePath = join(testDir, 'circular-a.yaml');
-      expect(() => loadYaml(filePath)).toThrow(/Circular reference detected/);
+      const filePath = writeTestFile('circular-a.yaml', `
+ref:
+  $ref: "./circular-b.yaml"
+`);
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('circular_ref');
+      expect(error.refChain?.length).toBeGreaterThan(1);
     });
 
     it('should throw error for multi-hop circular references (A->B->C->A)', () => {
-      writeTestFile('cycle-a.yaml', `
-ref:
-  $ref: "./cycle-b.yaml"
-`);
-      writeTestFile('cycle-b.yaml', `
-ref:
-  $ref: "./cycle-c.yaml"
-`);
-      writeTestFile('cycle-c.yaml', `
-ref:
-  $ref: "./cycle-a.yaml"
-`);
-      const filePath = join(testDir, 'cycle-a.yaml');
+      writeTestFile('cycle-b.yaml', 'ref:\n  $ref: "./cycle-c.yaml"');
+      writeTestFile('cycle-c.yaml', 'ref:\n  $ref: "./cycle-a.yaml"');
+      const filePath = writeTestFile('cycle-a.yaml', 'ref:\n  $ref: "./cycle-b.yaml"');
       expect(() => loadYaml(filePath)).toThrow(/Circular reference detected/);
     });
 
     it('should throw error for longer circular reference chains (A->B->C->D->B)', () => {
-      writeTestFile('long-cycle-a.yaml', `
-ref:
-  $ref: "./long-cycle-b.yaml"
-`);
-      writeTestFile('long-cycle-b.yaml', `
-ref:
-  $ref: "./long-cycle-c.yaml"
-`);
-      writeTestFile('long-cycle-c.yaml', `
-ref:
-  $ref: "./long-cycle-d.yaml"
-`);
-      writeTestFile('long-cycle-d.yaml', `
-ref:
-  $ref: "./long-cycle-b.yaml"
-`);
-      const filePath = join(testDir, 'long-cycle-a.yaml');
+      writeTestFile('long-cycle-b.yaml', 'ref:\n  $ref: "./long-cycle-c.yaml"');
+      writeTestFile('long-cycle-c.yaml', 'ref:\n  $ref: "./long-cycle-d.yaml"');
+      writeTestFile('long-cycle-d.yaml', 'ref:\n  $ref: "./long-cycle-b.yaml"');
+      const filePath = writeTestFile('long-cycle-a.yaml', 'ref:\n  $ref: "./long-cycle-b.yaml"');
       expect(() => loadYaml(filePath)).toThrow(/Circular reference detected/);
     });
 
-    it('should allow sibling references to same file without false positive', () => {
-      writeTestFile('sibling-shared.yaml', `
-value: shared
-`);
-      const filePath = writeTestFile('sibling-refs.yaml', `
-first:
-  $ref: "./sibling-shared.yaml"
-second:
-  $ref: "./sibling-shared.yaml"
-`);
-      // This should NOT throw - siblings can reference the same file
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        first: { value: 'shared' },
-        second: { value: 'shared' },
-      });
+    it('should report a missing referenced file as file_not_found with its ref chain', () => {
+      writeTestFile('middle.yaml', 'data:\n  $ref: "./non-existent.yaml"');
+      const filePath = writeTestFile('missing-ref.yaml', 'middle:\n  $ref: "./middle.yaml"');
+
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('file_not_found');
+      expect(error.path).toBe(join(caseDir, 'non-existent.yaml'));
+      expect(error.refChain).toEqual([
+        join(caseDir, 'middle.yaml') + '#',
+        join(caseDir, 'non-existent.yaml') + '#',
+      ]);
+      expect(error.cause).toBeDefined();
     });
 
-    it('should throw error for non-existent file', () => {
-      const filePath = writeTestFile('missing-ref.yaml', `
-data:
-  $ref: "./non-existent.yaml"
-`);
-      expect(() => loadYaml(filePath)).toThrow();
+    it('should report a missing root file as file_not_found', () => {
+      const error = catchError(() => loadYaml(join(caseDir, 'does-not-exist.yaml')));
+      expect(error.type).toBe('file_not_found');
+      expect(error.message).toMatch(/Failed to load file/);
     });
 
-    it('should throw error for invalid JSON pointer path', () => {
-      writeTestFile('valid.yaml', `
-existing:
-  key: value
-`);
-      const filePath = writeTestFile('invalid-pointer.yaml', `
-data:
-  $ref: "./valid.yaml#/nonexistent/path"
-`);
-      expect(() => loadYaml(filePath)).toThrow(/Cannot resolve pointer/);
+    it('should report malformed root YAML as parse_error', () => {
+      const filePath = writeTestFile('malformed.yaml', 'invalid: [unbalanced bracket');
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('parse_error');
+      expect(error.message).toMatch(/Failed to parse YAML file/);
     });
 
-    it('should throw error when JSON pointer traverses through a primitive value', () => {
-      writeTestFile('with-primitive.yaml', `
-items:
-  - first
-  - second
-`);
-      const filePath = writeTestFile('primitive-traverse.yaml', `
-data:
-  $ref: "./with-primitive.yaml#/items/0/invalid"
-`);
-      expect(() => loadYaml(filePath)).toThrow(/Cannot resolve pointer/);
+    it('should report a malformed referenced file as parse_error, not file_not_found', () => {
+      const brokenPath = writeTestFile('broken.json', '{ not json');
+      const filePath = writeTestFile('refs-broken.yaml', 'data:\n  $ref: "./broken.json"');
+
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('parse_error');
+      expect(error.path).toBe(brokenPath);
+      expect(error.message).toContain(brokenPath);
+      expect(error.cause).toBeInstanceOf(SyntaxError);
     });
   });
 
   describe('preserving non-ref content', () => {
     it('should preserve other properties alongside resolved refs', () => {
-      writeTestFile('partial.yaml', `
-refValue: from file
-`);
+      writeTestFile('partial.yaml', 'refValue: from file');
       const filePath = writeTestFile('mixed.yaml', `
 inline: direct value
 external:
   $ref: "./partial.yaml"
 another: also direct
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
+      expect(loadYaml(filePath)).toEqual({
         inline: 'direct value',
         external: { refValue: 'from file' },
         another: 'also direct',
@@ -559,93 +600,77 @@ another: also direct
     });
 
     it('should ignore sibling properties when $ref is present (per JSON Schema/OpenAPI spec)', () => {
-      writeTestFile('ref-target.yaml', `
-fromRef: true
-value: 42
-`);
+      writeTestFile('ref-target.yaml', 'fromRef: true\nvalue: 42');
       const filePath = writeTestFile('ref-with-siblings.yaml', `
 data:
   $ref: "./ref-target.yaml"
   ignored: this should be ignored
   alsoIgnored: this too
 `);
-      const result = loadYaml(filePath);
-      // When $ref is present, sibling properties are ignored and the entire object
-      // is replaced with the referenced content
-      expect(result).toEqual({
-        data: {
-          fromRef: true,
-          value: 42,
-        },
-      });
-      // Verify that sibling properties are NOT in the result
-      expect(result.data).not.toHaveProperty('ignored');
-      expect(result.data).not.toHaveProperty('alsoIgnored');
-    });
-
-    it('should handle primitive values correctly', () => {
-      const filePath = writeTestFile('primitives.yaml', `
-string: hello
-number: 42
-float: 3.14
-boolean: true
-nullValue: null
-`);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        string: 'hello',
-        number: 42,
-        float: 3.14,
-        boolean: true,
-        nullValue: null,
-      });
+      expect(loadYaml(filePath)).toEqual({ data: { fromRef: true, value: 42 } });
     });
   });
 
   describe('file caching', () => {
-    it('should reuse cached files when the same file is referenced multiple times', () => {
-      writeTestFile('shared.yaml', `
-sharedValue: cached content
-`);
+    const readsOf = (spy: jest.SpyInstance, filePath: string): number =>
+      spy.mock.calls.filter(([path]) => path === filePath).length;
+
+    it('should read a file once when it is referenced multiple times', () => {
+      const sharedPath = writeTestFile('shared.yaml', 'sharedValue: cached content');
       const filePath = writeTestFile('multi-ref-same-file.yaml', `
 first:
   $ref: "./shared.yaml"
 second:
-  $ref: "./shared.yaml"
+  $ref: "./shared.yaml#/sharedValue"
 third:
   $ref: "./shared.yaml"
 `);
+      const spy = jest.spyOn(fs, 'readFileSync');
       const result = loadYaml(filePath);
+
       expect(result).toEqual({
         first: { sharedValue: 'cached content' },
-        second: { sharedValue: 'cached content' },
+        second: 'cached content',
         third: { sharedValue: 'cached content' },
       });
+      expect(readsOf(spy, sharedPath)).toBe(1);
     });
 
-    it('should cache files with different JSON pointers to the same file', () => {
-      writeTestFile('multi-section.yaml', `
-sectionA:
-  dataA: value A
-sectionB:
-  dataB: value B
+    it('should re-read evicted files when the cache is full', () => {
+      const aPath = writeTestFile('cache-a.yaml', 'value: a');
+      writeTestFile('cache-b.yaml', 'value: b');
+      const filePath = writeTestFile('main-cache.yaml', `
+ref1:
+  $ref: "./cache-a.yaml"
+ref2:
+  $ref: "./cache-b.yaml"
+ref3:
+  $ref: "./cache-a.yaml"
 `);
-      const filePath = writeTestFile('multi-pointer-same-file.yaml', `
-partA:
-  $ref: "./multi-section.yaml#/sectionA"
-partB:
-  $ref: "./multi-section.yaml#/sectionB"
+      const spy = jest.spyOn(fs, 'readFileSync');
+      const result = loadYaml(filePath, { maxCacheSize: 1 });
+
+      expect(result).toEqual({ ref1: { value: 'a' }, ref2: { value: 'b' }, ref3: { value: 'a' } });
+      expect(readsOf(spy, aPath)).toBe(2);
+    });
+
+    it('should not cache at all when maxCacheSize is 0', () => {
+      const sharedPath = writeTestFile('zero-cache.yaml', 'value: test');
+      const filePath = writeTestFile('main-zero.yaml', `
+data1:
+  $ref: "./zero-cache.yaml"
+data2:
+  $ref: "./zero-cache.yaml"
 `);
-      const result = loadYaml(filePath);
-      expect(result).toEqual({
-        partA: { dataA: 'value A' },
-        partB: { dataB: 'value B' },
-      });
+      const spy = jest.spyOn(fs, 'readFileSync');
+      const result = loadYaml(filePath, { maxCacheSize: 0 });
+
+      expect(result).toEqual({ data1: { value: 'test' }, data2: { value: 'test' } });
+      expect(readsOf(spy, sharedPath)).toBe(2);
     });
   });
 
-  // Enhanced Features Tests
-  describe('enhanced features - generic type support', () => {
+  describe('generic type support', () => {
     interface TestConfig {
       name: string;
       version: number;
@@ -665,184 +690,109 @@ server:
 `);
       const result = loadYaml<TestConfig>(filePath);
 
-      // TypeScript should infer types correctly
-      expect(result.name).toBe('test-service');
-      expect(result.version).toBe(1.0);
-      expect(result.server.host).toBe('localhost');
-      expect(result.server.port).toBe(3000);
-
       // This should compile without errors
       const host: string = result.server.host;
       const port: number = result.server.port;
+      expect(result.name).toBe('test-service');
       expect(host).toBe('localhost');
       expect(port).toBe(3000);
     });
-
-    it('should work with complex nested types', () => {
-      interface ComplexType {
-        users: Array<{
-          id: number;
-          name: string;
-          active: boolean;
-        }>;
-        metadata: {
-          created: string;
-          tags: string[];
-        };
-      }
-
-      const filePath = writeTestFile('complex.yaml', `
-users:
-  - id: 1
-    name: John
-    active: true
-  - id: 2
-    name: Jane
-    active: false
-metadata:
-  created: "2023-01-01"
-  tags: [tag1, tag2]
-`);
-
-      const result = loadYaml<ComplexType>(filePath);
-      expect(result.users).toHaveLength(2);
-      expect(result.users[0].name).toBe('John');
-      expect(result.metadata.tags).toEqual(['tag1', 'tag2']);
-    });
   });
 
-  describe('enhanced features - LRU file cache', () => {
-    it('should respect cache size limits', () => {
-      // Create multiple files to test cache eviction
-      for (let i = 0; i < 10; i++) {
-        writeTestFile(`cache-${i}.yaml`, `
-value: ${i}
-`);
-      }
-
-      const options: YamlLoaderOptions = { maxCacheSize: 3 };
-      const filePath = writeTestFile('main-cache.yaml', `
-ref1:
-  $ref: "./cache-0.yaml"
-ref2:
-  $ref: "./cache-1.yaml"
-ref3:
-  $ref: "./cache-2.yaml"
-ref4:
-  $ref: "./cache-3.yaml"
-`);
-
-      const result = loadYaml(filePath, options);
-      expect(result.ref1.value).toBe(0);
-      expect(result.ref2.value).toBe(1);
-      expect(result.ref3.value).toBe(2);
-      expect(result.ref4.value).toBe(3);
-    });
-  });
-
-  describe('enhanced features - error handling', () => {
-    it('should throw YamlLoaderError for circular references', () => {
-      writeTestFile('circular-a.yaml', `
-ref:
-  $ref: "./circular-b.yaml"
-`);
-      writeTestFile('circular-b.yaml', `
-ref:
-  $ref: "./circular-a.yaml"
-`);
-
-      expect(() => loadYaml(join(testDir, 'circular-a.yaml'))).toThrow(YamlLoaderError);
-    });
-
-    it('should provide detailed error information', () => {
-      writeTestFile('invalid-ref.yaml', `
-data:
-  $ref: "./non-existent.yaml"
-`);
-
-      expect(() => loadYaml(join(testDir, 'invalid-ref.yaml'))).toThrow(YamlLoaderError);
-
-      try {
-        loadYaml(join(testDir, 'invalid-ref.yaml'));
-      }
-      catch (error) {
-        expect(error).toBeInstanceOf(YamlLoaderError);
-        if (error instanceof YamlLoaderError) {
-          expect(error.type).toBe('file_not_found');
-          expect(error.path).toBeDefined();
-        }
-      }
-    });
-  });
-
-  describe('enhanced features - security', () => {
+  describe('security', () => {
     it('should prevent directory traversal by default', () => {
-      writeTestFile('safe.yaml', `
-data: safe
-`);
-
-      const filePath = writeTestFile('traversal.yaml', `
+      writeTestFile('safe.yaml', 'data: safe');
+      const filePath = writeTestFile('root/traversal.yaml', `
 data:
   $ref: "../safe.yaml"
 `);
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('access_denied');
+    });
 
-      expect(() => loadYaml(filePath)).toThrow(YamlLoaderError);
+    it('should not allow a directory that only shares a name prefix with the root', () => {
+      writeTestFile('app-secrets/secret.yaml', 'password: hunter2');
+      const filePath = writeTestFile('app/main.yaml', `
+data:
+  $ref: "../app-secrets/secret.yaml"
+`);
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('access_denied');
+    });
+
+    it('should not follow symlinks that point outside the root', () => {
+      const outsidePath = writeTestFile('outside.yaml', 'password: hunter2');
+      mkdirSync(join(caseDir, 'root'));
+      symlinkSync(outsidePath, join(caseDir, 'root', 'link.yaml'));
+      const filePath = writeTestFile('root/main.yaml', `
+data:
+  $ref: "./link.yaml"
+`);
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('access_denied');
+    });
+
+    it('should not allow absolute paths outside the root', () => {
+      const outsidePath = writeTestFile('outside.yaml', 'password: hunter2');
+      const filePath = writeTestFile('root/main.yaml', `
+data:
+  $ref: "${outsidePath}"
+`);
+      const error = catchError(() => loadYaml(filePath));
+      expect(error.type).toBe('access_denied');
     });
 
     it('should allow directory traversal when enabled', () => {
-      // Create a file in parent directory of testDir
-      const parentDir = dirname(testDir);
-      const outsideFile = join(parentDir, 'outside.yaml');
-      writeFileSync(outsideFile, 'data: outside');
-
-      const filePath = writeTestFile('traversal-allowed.yaml', `
+      writeTestFile('outside.yaml', 'data: outside');
+      const filePath = writeTestFile('root/traversal-allowed.yaml', `
 data:
   $ref: "../outside.yaml"
 `);
-
-      const options: YamlLoaderOptions = { allowExternalAccess: true };
-      const result = loadYaml(filePath, options);
+      const result = loadYaml(filePath, { allowExternalAccess: true });
       expect(result.data.data).toBe('outside');
-
-      // Clean up
-      rmSync(outsideFile, { force: true });
     });
   });
 
-  describe('enhanced features - debug mode', () => {
-    it('should provide debug information', () => {
-      writeTestFile('debug-ref.yaml', `
-message: debug content
-`);
-
-      const filePath = writeTestFile('debug-main.yaml', `
+  describe('debug mode', () => {
+    it('should report every resolved reference and loaded file', () => {
+      const nestedPath = writeTestFile('debug-nested.yaml', 'message: nested debug');
+      const targetPath = writeTestFile('debug-target.yaml', `
 data:
-  $ref: "./debug-ref.yaml"
+  $ref: "./debug-nested.yaml"
+`);
+      const filePath = writeTestFile('debug-complex.yaml', `
+root:
+  $ref: "./debug-target.yaml"
+again:
+  $ref: "./debug-target.yaml#/data"
 `);
 
       const { result, debug } = loadYamlWithDebug(filePath);
 
-      expect(result.data.message).toBe('debug content');
-      expect(debug.refChain).toBeDefined();
-      expect(debug.fileCache).toBeDefined();
+      expect(result.root.data.message).toBe('nested debug');
+      expect(debug.refChain).toEqual([
+        targetPath + '#',
+        nestedPath + '#',
+        targetPath + '#/data',
+        nestedPath + '#',
+      ]);
+      expect([...debug.fileCache.entries()]).toEqual([
+        [filePath, 'object'],
+        [targetPath, 'object'],
+        [nestedPath, 'object'],
+      ]);
       expect(debug.resolutionTime).toBeGreaterThanOrEqual(0);
     });
   });
 
-  describe('enhanced features - validation', () => {
+  describe('validation', () => {
     it('should validate correct YAML references', () => {
-      writeTestFile('valid-ref.yaml', `
-message: valid content
-`);
-
+      writeTestFile('valid-ref.yaml', 'message: valid content');
       const filePath = writeTestFile('valid-main.yaml', `
 data:
   $ref: "./valid-ref.yaml"
 `);
-
-      const result = validateYamlReferences(filePath);
-      expect(result.isValid).toBe(true);
-      expect(result.errors).toHaveLength(0);
+      expect(validateYamlReferences(filePath)).toEqual({ isValid: true, errors: [], warnings: [] });
     });
 
     it('should detect invalid references', () => {
@@ -850,19 +800,46 @@ data:
 data:
   $ref: "./missing.yaml"
 `);
-
       const result = validateYamlReferences(filePath);
       expect(result.isValid).toBe(false);
       expect(result.errors).toHaveLength(1);
-      expect(result.errors[0]).toBeInstanceOf(YamlLoaderError);
+      expect(result.errors[0].type).toBe('file_not_found');
+    });
+
+    it('should report parse errors', () => {
+      const filePath = writeTestFile('bad-parse.yaml', 'invalid: [unbalanced');
+      const result = validateYamlReferences(filePath);
+      expect(result.isValid).toBe(false);
+      expect(result.errors[0].type).toBe('parse_error');
+    });
+
+    it('should warn about properties ignored next to $ref', () => {
+      writeTestFile('target.yaml', 'value: 1');
+      const filePath = writeTestFile('siblings.yaml', `
+data:
+  $ref: "./target.yaml"
+  description: ignored
+`);
+      const result = validateYamlReferences(filePath);
+      expect(result.isValid).toBe(true);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain('description');
+    });
+
+    it('should wrap unexpected errors from custom resolvers', () => {
+      const filePath = writeTestFile('throwing-resolver.yaml', 'data:\n  $ref: "boom:now"');
+      const customResolvers = new Map([['boom:', () => { throw new Error('kaboom'); }]]);
+
+      const result = validateYamlReferences(filePath, { customResolvers });
+      expect(result.isValid).toBe(false);
+      expect(result.errors[0].type).toBe('parse_error');
+      expect(result.errors[0].message).toBe('Unexpected error: kaboom');
     });
   });
 
-  describe('enhanced features - builder pattern', () => {
+  describe('builder pattern', () => {
     it('should create configured loader with builder', () => {
-      writeTestFile('builder-test.yaml', `
-value: builder-test
-`);
+      const filePath = writeTestFile('builder-test.yaml', 'value: builder-test');
 
       const loader = new YamlLoaderBuilder()
         .withCache(50)
@@ -870,571 +847,109 @@ value: builder-test
         .withExternalAccess(false)
         .build();
 
-      const filePath = join(testDir, 'builder-test.yaml');
-      const result = loader(filePath);
-      expect(result.value).toBe('builder-test');
+      expect(loader(filePath).value).toBe('builder-test');
     });
 
-    it('should support custom resolvers', () => {
-      const filePath = writeTestFile('custom-resolver.yaml', `
-data: direct
-`);
-
-      const loader = new YamlLoaderBuilder()
-        .withCustomResolver('custom:', (ref) => ({ custom: ref.replace('custom:', '') }))
-        .build();
-
-      const testFilePath = writeTestFile('test-custom.yaml', `
-data:
-  $ref: "custom:test-value"
-`);
-
-      const result = loader(testFilePath);
-      expect(result.data.custom).toBe('test-value');
-    });
-
-    it('should create generic builder with type inference', function () {
+    it('should create generic builder with type inference', () => {
       interface BuilderTest {
         value: string;
         count: number;
       }
 
-      writeTestFile('builder-generic.yaml', `
-value: generic-test
-count: 42
-`);
-
-      const loader = new YamlLoaderBuilder()
-        .withCache(25)
-        .buildGeneric<BuilderTest>();
-
-      const filePath = join(testDir, 'builder-generic.yaml');
+      const filePath = writeTestFile('builder-generic.yaml', 'value: generic-test\ncount: 42');
+      const loader = new YamlLoaderBuilder().withCache(25).buildGeneric<BuilderTest>();
       const result = loader(filePath);
 
-      // TypeScript should infer the type correctly
-      expect(result.value).toBe('generic-test');
-      expect(result.count).toBe(42);
-
-      // This should compile without errors
       const value: string = result.value;
       const count: number = result.count;
       expect(value).toBe('generic-test');
       expect(count).toBe(42);
     });
-  });
 
-  describe('enhanced features - configuration', () => {
-    it('should merge default options with provided options', () => {
-      writeTestFile('config-test.yaml', `
-value: config-test
-`);
+    it('should not let later builder calls change a loader already built', () => {
+      const filePath = writeTestFile('builder-isolation.yaml', 'data:\n  $ref: "custom:value"');
 
-      const options: YamlLoaderOptions = {
-        maxCacheSize: 75,
-        strictMode: true,
-      };
+      const builder = new YamlLoaderBuilder();
+      const before = builder.build();
+      const after = builder.withCustomResolver('custom:', () => 'resolved').build();
 
-      const filePath = join(testDir, 'config-test.yaml');
-      const result = loadYaml(filePath, options);
-      expect(result.value).toBe('config-test');
-    });
-
-    it('should handle empty options object', () => {
-      const filePath = writeTestFile('empty-options.yaml', `
-value: empty-options
-`);
-
-      const result = loadYaml(filePath, {});
-      expect(result.value).toBe('empty-options');
+      expect(after(filePath)).toEqual({ data: 'resolved' });
+      expect(() => before(filePath)).toThrow(YamlLoaderError);
     });
   });
 
-  describe('enhanced features - backward compatibility', () => {
-    it('should work with original loadYaml function signature', () => {
-      const filePath = writeTestFile('compat.yaml', `
-name: compatibility-test
-version: 1.0
-`);
-
-      const result = loadYaml(filePath);
-      expect(result.name).toBe('compatibility-test');
-      expect(result.version).toBe(1.0);
-    });
-
-    it('should work with default export', () => {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const yamlLoader = require('./index').default;
-      const filePath = writeTestFile('default-export.yaml', `
-name: default-export-test
-`);
-
-      const result = yamlLoader(filePath);
-      expect(result.name).toBe('default-export-test');
-    });
-  });
-
-  // Additional tests for 100% coverage
-  describe('LRU File Cache edge cases', () => {
-    it('should use default cache size when not specified', () => {
-      // This tests the default parameter in LRUFileCache constructor
-      writeTestFile('cache-default.yaml', 'value: default');
-      const result = loadYaml(writeTestFile('main-default.yaml', `
-$ref: "./cache-default.yaml"
-`));
-      expect(result.value).toBe('default');
-    });
-
-    it('should handle cache when firstKey is undefined', () => {
-      // This tests the else branch when firstKey is undefined
-      // Create a scenario where cache might have undefined firstKey
-      const options: YamlLoaderOptions = { maxCacheSize: 1 };
-      writeTestFile('edge1.yaml', 'value: 1');
-      writeTestFile('edge2.yaml', 'value: 2');
-
-      const result = loadYaml(writeTestFile('edge-main.yaml', `
-ref1:
-  $ref: "./edge1.yaml"
-ref2:
-  $ref: "./edge2.yaml"
-`), options);
-
-      expect(result.ref1.value).toBe(1);
-      expect(result.ref2.value).toBe(2);
-    });
-  });
-
-  describe('error handling edge cases', () => {
-    it('should handle internal reference resolution without root document', () => {
-      // This tests the case where rootDoc is not available for internal references
-      // We need to create a scenario that triggers this specific error path
-      writeTestFile('target.yaml', 'value: target');
-
-      // Create a scenario that might lead to internal reference without root
-      const filePath = writeTestFile('internal-no-root.yaml', `
-$ref: "./target.yaml"
-`);
-
-      try {
-        // This should work fine since it's an external reference
-        loadYaml(filePath);
-        // Now test a malformed internal reference
-        const badFile = writeTestFile('bad-internal.yaml', `
+  describe('custom resolvers', () => {
+    it('should support custom resolvers', () => {
+      const filePath = writeTestFile('test-custom.yaml', `
 data:
-  $ref: "#/nonexistent"
+  $ref: "custom:test-value"
 `);
-        loadYaml(badFile);
-      }
-      catch (error) {
-        // Expected for the bad internal reference
-        expect(error).toBeInstanceOf(YamlLoaderError);
-      }
-    });
-
-    it('should handle YamlLoaderError wrapping correctly', () => {
-      // Test the error wrapping in loadYaml function
-      const invalidFile = writeTestFile('invalid-syntax.yaml', 'invalid: [');
-
-      expect(() => loadYaml(invalidFile)).toThrow(YamlLoaderError);
-    });
-
-    it('should handle generic error types in validation', async () => {
-      // Test the catch-all error handling in validateYamlReferences
-      const filePath = writeTestFile('validation-test.yaml', 'data: test');
-
-      // Mock a scenario that causes a non-YamlLoaderError
-      const originalLoadFile = readFileSync;
-      const mockError = new Error('Unexpected error');
-
-      // Temporarily override to test error handling
-      const originalModule = await import('./index');
-
-      try {
-        // This will pass normally
-        const result = validateYamlReferences(filePath);
-        expect(result.isValid).toBe(true);
-      }
-      catch (error) {
-        expect(error).toBeInstanceOf(YamlLoaderError);
-      }
-    });
-  });
-
-  describe('custom resolvers edge cases', () => {
-    it('should handle multiple custom resolver prefixes', () => {
-      const filePath = writeTestFile('multi-custom.yaml', `
-data: direct
-`);
-
       const loader = new YamlLoaderBuilder()
         .withCustomResolver('custom:', (ref) => ({ custom: ref.replace('custom:', '') }))
-        .withCustomResolver('special:', (ref) => ({ special: ref.replace('special:', '') }))
         .build();
 
-      const testFilePath = writeTestFile('test-multi-custom.yaml', `
+      expect(loader(filePath).data.custom).toBe('test-value');
+    });
+
+    it('should handle multiple custom resolver prefixes', () => {
+      const filePath = writeTestFile('test-multi-custom.yaml', `
 data1:
   $ref: "custom:test-value1"
 data2:
   $ref: "special:test-value2"
 `);
+      const loader = new YamlLoaderBuilder()
+        .withCustomResolver('custom:', (ref) => ({ custom: ref.replace('custom:', '') }))
+        .withCustomResolver('special:', (ref) => ({ special: ref.replace('special:', '') }))
+        .build();
 
-      const result = loader(testFilePath);
+      const result = loader(filePath);
       expect(result.data1.custom).toBe('test-value1');
       expect(result.data2.special).toBe('test-value2');
     });
 
-    it('should handle custom resolver that returns complex object', () => {
-      const filePath = writeTestFile('complex-custom.yaml', 'data: direct');
-
+    it('should take precedence over file references with the same prefix', () => {
+      writeTestFile('remote/schema.yaml', 'from: file');
+      const filePath = writeTestFile('precedence.yaml', 'data:\n  $ref: "./remote/schema.yaml"');
       const loader = new YamlLoaderBuilder()
-        .withCustomResolver('complex:', (ref) => ({
-          nested: {
-            value: ref.replace('complex:', ''),
-            array: [1, 2, 3],
-          },
-        }))
+        .withCustomResolver('./remote/', () => ({ from: 'resolver' }))
         .build();
 
-      const testFilePath = writeTestFile('test-complex-custom.yaml', `
-data:
-  $ref: "complex:nested-value"
-`);
+      expect(loader(filePath)).toEqual({ data: { from: 'resolver' } });
+    });
 
-      const result = loader(testFilePath);
-      expect(result.data.nested.value).toBe('nested-value');
-      expect(result.data.nested.array).toEqual([1, 2, 3]);
+    it('should resolve references inside custom resolver results', () => {
+      writeTestFile('resolver-target.yaml', 'value: from-file');
+      const filePath = writeTestFile('resolver-nested.yaml', 'data:\n  $ref: "alias:target"');
+      const loader = new YamlLoaderBuilder()
+        .withCustomResolver('alias:', () => ({ nested: { $ref: './resolver-target.yaml' } }))
+        .build();
+
+      expect(loader(filePath)).toEqual({ data: { nested: { value: 'from-file' } } });
+    });
+
+    it('should detect cycles through custom resolvers', () => {
+      const filePath = writeTestFile('resolver-cycle.yaml', 'data:\n  $ref: "loop:x"');
+      const loader = new YamlLoaderBuilder()
+        .withCustomResolver('loop:', () => ({ $ref: 'loop:x' }))
+        .build();
+
+      expect(() => loader(filePath)).toThrow(/Circular reference detected/);
     });
   });
 
-  describe('debug information completeness', () => {
-    it('should provide complete debug information for complex references', () => {
-      writeTestFile('debug-nested.yaml', 'message: nested debug');
-      writeTestFile('debug-target.yaml', `
-data:
-  $ref: "./debug-nested.yaml"
-`);
-
-      const filePath = writeTestFile('debug-complex.yaml', `
-root:
-  $ref: "./debug-target.yaml"
-`);
-
-      const { result, debug } = loadYamlWithDebug(filePath);
-
-      expect(result.root.data.message).toBe('nested debug');
-      expect(debug.refChain).toEqual([]);
-      expect(debug.fileCache.size).toBeGreaterThan(0);
-      expect(debug.resolutionTime).toBeGreaterThanOrEqual(0);
-      // Just verify cache has entries, not specific keys
-      expect(debug.fileCache.keys().next().value).toBeDefined();
-    });
-  });
-
-  describe('file system edge cases', () => {
-    it('should handle empty JSON files', () => {
-      const filePath = writeTestFile('empty.json', '{}');
-      const result = loadYaml(filePath);
-      expect(result).toEqual({});
+  describe('backward compatibility', () => {
+    it('should accept the deprecated strictMode option', () => {
+      const filePath = writeTestFile('config-test.yaml', 'value: config-test');
+      const options: YamlLoaderOptions = { maxCacheSize: 75, strictMode: true };
+      expect(loadYaml(filePath, options).value).toBe('config-test');
     });
 
-    it('should handle YAML files with only comments', () => {
-      const filePath = writeTestFile('comments-only.yaml', '# This is a comment\n# Another comment');
-      const result = loadYaml(filePath);
-      expect(result).toBeNull();
-    });
-
-    it('should handle non-YamlLoaderError in validation', () => {
-      // Mock a scenario that causes a generic error (not YamlLoaderError)
-      const filePath = writeTestFile('validation-error.yaml', 'data: test');
-
-      // We need to trigger the else branch in validateYamlReferences
-      // This would normally happen if resolveRefs throws a non-YamlLoaderError
-      // Let's test with a file that might cause parsing issues
-      const badFilePath = writeTestFile('bad-parse.yaml', 'invalid: [unbalanced');
-
-      const result = validateYamlReferences(badFilePath);
-      expect(result.isValid).toBe(false);
-      expect(result.errors).toHaveLength(1);
-      expect(result.errors[0]).toBeInstanceOf(YamlLoaderError);
-      expect(result.errors[0].type).toBe('parse_error');
-    });
-  });
-
-  // Additional tests for uncovered edge cases
-  describe('deep edge cases for 100% coverage', () => {
-    it('should handle cache edge case where firstKey is undefined', () => {
-      // This tests the else branch in LRUFileCache.set when firstKey is undefined
-      // Create a scenario where cache.size >= maxSize but firstKey is undefined
-      const options: YamlLoaderOptions = { maxCacheSize: 0 }; // Zero size cache
-
-      writeTestFile('edge-zero-cache.yaml', 'value: test');
-
-      // This should still work even with zero cache
-      const result = loadYaml(writeTestFile('main-zero.yaml', `
-data:
-  $ref: "./edge-zero-cache.yaml"
-`), options);
-
-      expect(result.data.value).toBe('test');
-    });
-
-    it('should test default parameter in LRUFileCache constructor', () => {
-      // This explicitly tests the default parameter path
-      writeTestFile('default-construct.yaml', 'value: default-construct');
-
-      // Use options without maxCacheSize to trigger default
-      const options: YamlLoaderOptions = {};
-
-      const result = loadYaml(writeTestFile('main-default-construct.yaml', `
-data:
-  $ref: "./default-construct.yaml"
-`), options);
-
-      expect(result.data.value).toBe('default-construct');
-    });
-
-    it('should handle malformed YAML that causes parser errors', () => {
-      // This tests the error wrapping path in loadYaml
-      const malformedFile = writeTestFile('malformed.yaml', 'invalid: [unbalanced bracket');
-
-      expect(() => loadYaml(malformedFile)).toThrow(YamlLoaderError);
-      expect(() => loadYaml(malformedFile)).toThrow(/Failed to parse YAML file/);
-    });
-
-    it('should handle validation with unexpected error types', () => {
-      // This tests the else branch in validateYamlReferences error handling
-      const filePath = writeTestFile('validation-unexpected.yaml', 'data: test');
-
-      // Create a scenario that might cause a non-YamlLoaderError
-      // Using a file with encoding issues could trigger this
-      const badFile = writeTestFile('validation-unexpected.yaml', 'data: test');
-
-      const result = validateYamlReferences(badFile);
-      // Should either be valid (if no errors) or have proper error handling
-      if (!result.isValid) {
-        expect(result.errors[0]).toBeInstanceOf(YamlLoaderError);
-        if (result.errors[0].type === 'parse_error') {
-          expect(result.errors[0].message).toContain('Unexpected error');
-        }
-      }
-    });
-
-    it('should create a scenario that triggers cache edge behavior', () => {
-      // Try to create a scenario that might hit the remaining edge cases
-      const tinyCacheOptions: YamlLoaderOptions = { maxCacheSize: 1 };
-
-      writeTestFile('edge-1.yaml', 'value: first');
-      writeTestFile('edge-2.yaml', 'value: second');
-      writeTestFile('edge-3.yaml', 'value: third');
-
-      // Load files to trigger cache behavior
-      const result = loadYaml(writeTestFile('edge-main.yaml', `
-ref1:
-  $ref: "./edge-1.yaml"
-ref2:
-  $ref: "./edge-2.yaml"
-ref3:
-  $ref: "./edge-3.yaml"
-`), tinyCacheOptions);
-
-      expect(result.ref1.value).toBe('first');
-      expect(result.ref2.value).toBe('second');
-      expect(result.ref3.value).toBe('third');
-    });
-
-    it('should test LRUFileCache edge case scenarios', () => {
-      // Test specific edge cases to get remaining coverage
-
-      // Create a cache with zero size to trigger edge behavior
-      const zeroSizeOptions: YamlLoaderOptions = { maxCacheSize: 0 };
-
-      writeTestFile('zero-cache-1.yaml', 'value: test1');
-      writeTestFile('zero-cache-2.yaml', 'value: test2');
-
-      const result = loadYaml(writeTestFile('zero-cache-main.yaml', `
-data1:
-  $ref: "./zero-cache-1.yaml"
-data2:
-  $ref: "./zero-cache-2.yaml"
-`), zeroSizeOptions);
-
-      expect(result.data1.value).toBe('test1');
-      expect(result.data2.value).toBe('test2');
-    });
-
-    it('should force error paths for complete coverage', () => {
-      // Create scenarios that force the remaining error paths
-
-      // 1. Create a file that causes validation to hit unexpected error path
-      const malformedFile = writeTestFile('unexpected-error.yaml', 'invalid: [');
-
-      try {
-        loadYaml(malformedFile);
-      }
-      catch (error: any) {
-        expect(error).toBeInstanceOf(YamlLoaderError);
-        expect(error?.message).toContain('Failed to parse YAML file');
-      }
-
-      // 2. Test validation with the malformed file
-      const validationResult = validateYamlReferences(malformedFile);
-      expect(validationResult.isValid).toBe(false);
-      expect(validationResult.errors).toHaveLength(1);
-      expect(validationResult.errors[0]).toBeInstanceOf(YamlLoaderError);
-    });
-
-    it('should attempt to reach 100% coverage through comprehensive testing', () => {
-      // Create final comprehensive test to try to hit remaining coverage gaps
-      // The main missing pieces are LRUFileCache clear() and size() methods
-      // Since these are unused in current implementation, we try creative approaches
-
-      writeTestFile('final-1.yaml', 'value: test1');
-      writeTestFile('final-2.yaml', 'value: test2');
-      writeTestFile('final-3.yaml', 'value: test3');
-      writeTestFile('final-4.yaml', 'value: test4');
-
-      // Test with very small cache to trigger edge behavior
-      const tinyCacheOptions: YamlLoaderOptions = { maxCacheSize: 1 };
-
-      const result = loadYaml(writeTestFile('final-main.yaml', `
-ref1:
-  $ref: "./final-1.yaml"
-ref2:
-  $ref: "./final-2.yaml"
-ref3:
-  $ref: "./final-3.yaml"
-ref4:
-  $ref: "./final-4.yaml"
-`), tinyCacheOptions);
-
-      expect(result.ref1.value).toBe('test1');
-      expect(result.ref2.value).toBe('test2');
-      expect(result.ref3.value).toBe('test3');
-      expect(result.ref4.value).toBe('test4');
-
-      // Use debug to verify cache behavior
-      const { debug } = loadYamlWithDebug(writeTestFile('final-debug.yaml', `
-ref:
-  $ref: "./final-1.yaml"
-`), tinyCacheOptions);
-
-      // The debug should show cache activity
-      expect(debug.fileCache.size).toBeGreaterThan(0);
-
-      // Try different cache configuration
-      const largeCacheOptions: YamlLoaderOptions = { maxCacheSize: 100 };
-      const largeResult = loadYaml(writeTestFile('final-large.yaml', `
-data:
-  $ref: "./final-1.yaml"
-`), largeCacheOptions);
-      expect(largeResult.data.value).toBe('test1');
-
-      // At this point, we've tested all major functionality
-      // The remaining uncovered lines are for truly unused LRUFileCache methods
-      // Achieving 100% coverage would require either:
-      // 1. Modifying source code to use these methods
-      // 2. Creating a testing-only API to access them
-      // 3. Accepting < 100% coverage for unused utility methods
-
-      // Verify all functionality works correctly
-      const validation = validateYamlReferences(writeTestFile('final-validation.yaml', `
-data:
-  $ref: "./final-1.yaml"
-`));
-      expect(validation.isValid).toBe(true);
-    });
-
-    it('should access LRUFileCache methods through test interface for 100% coverage', () => {
-      // Use the testing interface to access LRUFileCache methods directly
-
-      writeTestFile('cache-interface-test.yaml', 'value: interface-test');
-
-      // Load file to initialize cache (this hits default parameter path)
-      loadYaml(writeTestFile('cache-interface-main.yaml', `
-data:
-  $ref: "./cache-interface-test.yaml"
-`));
-
-      // Get access to cache through test interface
-      const cacheInterface = getTestCacheInterface(writeTestFile('cache-interface-access.yaml', `
-data:
-  $ref: "./cache-interface-test.yaml"
-`));
-
-      // Test LRUFileCache methods directly
-      expect(cacheInterface.size()).toBeGreaterThanOrEqual(0);
-
-      // Test has method
-      expect(cacheInterface.has('non-existent')).toBe(false);
-
-      // Test getCache method
-      const cacheMap = cacheInterface.getCache();
-      expect(cacheMap).toBeDefined();
-
-      // Test clear method - this should hit the uncovered lines
-      cacheInterface.clear();
-      expect(cacheInterface.size()).toBe(0);
-    });
-
-    it('should hit remaining branch coverage for 100%', () => {
-      // Target the remaining uncovered branches and statements
-
-      // Test default parameter in LRUFileCache constructor by explicitly not passing options
-      writeTestFile('default-param-test.yaml', 'value: default-test');
-
-      // Load with undefined options to trigger default parameter
-      const result1 = loadYaml(writeTestFile('default-param-main.yaml', `
-data:
-  $ref: "./default-param-test.yaml"
-`), undefined as any);
-
-      expect(result1.data.value).toBe('default-test');
-
-      // Test validation with non-YamlLoaderError scenarios
-      const invalidFile = writeTestFile('invalid-syntax.yaml', 'invalid: [unbalanced');
-
-      const validation = validateYamlReferences(invalidFile);
-      expect(validation.isValid).toBe(false);
-      expect(validation.errors).toHaveLength(1);
-
-      // Test edge case that might trigger cache behavior
-      const tinyOptions: YamlLoaderOptions = { maxCacheSize: 0 };
-
-      writeTestFile('edge-cache.yaml', 'value: edge-test');
-      const result2 = loadYaml(writeTestFile('edge-cache-main.yaml', `
-data:
-  $ref: "./edge-cache.yaml"
-`), tinyOptions);
-
-      expect(result2.data.value).toBe('edge-test');
-
-      // Load again to test cache behavior
-      const result3 = loadYaml(writeTestFile('edge-cache-main2.yaml', `
-data:
-  $ref: "./edge-cache.yaml"
-`), tinyOptions);
-
-      expect(result3.data.value).toBe('edge-test');
-
-      // Very specific edge case - create weird cache state
-      // This attempts to hit the else branch in LRUFileCache.set()
-      const weirdOptions: YamlLoaderOptions = { maxCacheSize: 1 };
-
-      // Create a scenario that might cause cache to be in edge state
-      writeTestFile('weird-cache.yaml', 'value: weird');
-
-      // Load multiple files rapidly to potentially trigger edge behavior
-      loadYaml(writeTestFile('weird-main-1.yaml', `
-data:
-  $ref: "./weird-cache.yaml"
-`), weirdOptions);
-
-      // The cache should handle this correctly
-      const result4 = loadYaml(writeTestFile('weird-main-2.yaml', `
-data:
-  $ref: "./weird-cache.yaml"
-`), weirdOptions);
-
-      expect(result4.data.value).toBe('weird');
+    it('should work with default export', () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const yamlLoader = require('./index').default;
+      const filePath = writeTestFile('default-export.yaml', 'name: default-export-test');
+      expect(yamlLoader(filePath).name).toBe('default-export-test');
     });
   });
 });
