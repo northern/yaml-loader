@@ -1,29 +1,25 @@
-import { readFileSync } from 'fs';
-import { resolve, dirname, extname } from 'path';
+import { readFileSync, realpathSync } from 'fs';
+import { resolve, dirname, extname, relative, isAbsolute, sep } from 'path';
 import { parse } from 'yaml';
 
 // Type definitions
-export interface YamlNode {
-  $ref?: string;
-  [key: string]: YamlNode | YamlNode[] | string | number | boolean | null | undefined;
-}
-
-export interface RefResolution {
-  filePath: string;
-  pointer: string;
-  resolved: any;
-}
-
 export interface YamlLoaderOptions {
+  /** Maximum number of parsed files kept in memory during a single load (default: 100). */
   maxCacheSize?: number;
+  /** Allow `$ref`s to files outside the directory of the root file (default: false). */
   allowExternalAccess?: boolean;
+  /** Synchronous resolvers keyed by `$ref` prefix, e.g. `env:`. */
   customResolvers?: Map<string, (ref: string) => any>;
+  /** @deprecated Has no effect. Kept for backward compatibility. */
   strictMode?: boolean;
 }
 
 export interface DebugInfo {
+  /** Every reference resolved during the load, in resolution order. */
   refChain: string[];
+  /** Files that were loaded, mapped to the kind of their top-level value. */
   fileCache: Map<string, string>;
+  /** Total time in milliseconds. */
   resolutionTime: number;
 }
 
@@ -33,13 +29,21 @@ export interface ValidationResult {
   warnings: string[];
 }
 
+export type YamlLoaderErrorType =
+  | 'circular_ref'
+  | 'file_not_found'
+  | 'invalid_pointer'
+  | 'parse_error'
+  | 'access_denied';
+
 // Error types
 export class YamlLoaderError extends Error {
   constructor(
     message: string,
-    public readonly type: 'circular_ref' | 'file_not_found' | 'invalid_pointer' | 'parse_error',
+    public readonly type: YamlLoaderErrorType,
     public readonly path?: string,
     public readonly refChain?: string[],
+    public readonly cause?: unknown,
   ) {
     super(message);
     this.name = 'YamlLoaderError';
@@ -49,11 +53,8 @@ export class YamlLoaderError extends Error {
 // LRU File Cache implementation
 class LRUFileCache {
   private cache = new Map<string, any>();
-  private maxSize: number;
 
-  constructor(maxSize: number = 100) {
-    this.maxSize = maxSize;
-  }
+  constructor(private readonly maxSize: number) {}
 
   get(key: string): any | undefined {
     const value = this.cache.get(key);
@@ -66,6 +67,9 @@ class LRUFileCache {
   }
 
   set(key: string, value: any): void {
+    if (this.maxSize <= 0) {
+      return;
+    }
     if (this.cache.size >= this.maxSize) {
       // Remove least recently used (first entry)
       const firstKey = this.cache.keys().next().value;
@@ -75,95 +79,144 @@ class LRUFileCache {
     }
     this.cache.set(key, value);
   }
-
-  has(key: string): boolean {
-    return this.cache.has(key);
-  }
-
-  clear(): void {
-    this.cache.clear();
-  }
-
-  size(): number {
-    return this.cache.size;
-  }
-
-  getCache(): Map<string, any> {
-    return this.cache;
-  }
 }
 
 // Resolution context for tracking state
 interface ResolutionContext {
+  rootDir: string;
+  realRootDir: string;
   pathChain: string[];
   pathSet: Set<string>;
+  visited: string[];
+  loadedFiles: Map<string, string>;
+  warnings: string[];
   fileCache: LRUFileCache;
   options: YamlLoaderOptions;
   startTime: number;
 }
 
-/**
- * Loads and parses a YAML or JSON file.
- * @param filename The absolute path to the file.
- * @returns The parsed content.
- */
-const loadFile = (filename: string): any => {
-  const content = readFileSync(filename, 'utf-8');
-  const ext = extname(filename).toLowerCase();
-
-  if (ext === '.json') {
-    return JSON.parse(content);
+const describeValue = (value: any): string => {
+  if (value === null) {
+    return 'null';
   }
-  return parse(content);
+  return Array.isArray(value) ? 'array' : typeof value;
 };
 
 /**
- * Resolves a JSON pointer path within an object.
+ * Loads and parses a YAML or JSON file.
+ * @param filename The absolute path to the file.
+ * @param refChain The reference chain that led to this file, for error reporting.
+ * @returns The parsed content.
+ */
+const loadFile = (filename: string, refChain: string[]): any => {
+  let content: string;
+  try {
+    content = readFileSync(filename, 'utf-8');
+  }
+  catch (error) {
+    throw new YamlLoaderError(
+      `Failed to load file: ${filename}`,
+      'file_not_found',
+      filename,
+      refChain,
+      error,
+    );
+  }
+
+  const isJson = extname(filename).toLowerCase() === '.json';
+  try {
+    return isJson ? JSON.parse(content) : parse(content);
+  }
+  catch (error) {
+    throw new YamlLoaderError(
+      `Failed to parse ${isJson ? 'JSON' : 'YAML'} file ${filename}: ${error instanceof Error ? error.message : String(error)}`,
+      'parse_error',
+      filename,
+      refChain,
+      error,
+    );
+  }
+};
+
+const ARRAY_INDEX = /^(0|[1-9]\d*)$/;
+
+/**
+ * Resolves a JSON pointer (RFC 6901) within an object.
  * @param obj The object to navigate.
  * @param pointer The JSON pointer path (e.g., "/definitions/User").
+ * @param refChain The reference chain, for error reporting.
  * @returns The value at the specified path.
  */
-const resolvePointer = (obj: any, pointer: string): any => {
-  if (!pointer || pointer === '' || pointer === '/') {
+const resolvePointer = (obj: any, pointer: string, refChain: string[]): any => {
+  // "/" is treated as the document root for backward compatibility
+  if (pointer === '' || pointer === '/') {
     return obj;
   }
 
-  const parts = pointer.split('/').filter(Boolean);
+  const fail = (reason: string): never => {
+    throw new YamlLoaderError(
+      `Cannot resolve pointer "${pointer}": ${reason}`,
+      'invalid_pointer',
+      pointer,
+      refChain,
+    );
+  };
+
+  if (!pointer.startsWith('/')) {
+    fail('pointer must start with "/"');
+  }
+
   let current = obj;
-
-  for (const part of parts) {
-    // Make sure current is a valid object that can be indexed
-    if (current === null || current === undefined || typeof current !== 'object') {
-      throw new YamlLoaderError(
-        `Cannot resolve pointer "${pointer}": path not found`,
-        'invalid_pointer',
-        pointer,
-      );
-    }
-
+  for (const part of pointer.slice(1).split('/')) {
     // Decode JSON pointer escape sequences
-    const decoded = part.replace(/~1/g, '/').replace(/~0/g, '~');
+    const key = part.replace(/~1/g, '/').replace(/~0/g, '~');
 
-    current = current[decoded];
+    const found = Array.isArray(current)
+      ? ARRAY_INDEX.test(key) && Number(key) < current.length
+      : current !== null && typeof current === 'object' && Object.prototype.hasOwnProperty.call(current, key);
+
+    if (!found) {
+      fail('path not found');
+    }
+    current = current[key];
   }
 
   return current;
 };
 
+const isWithin = (dir: string, target: string): boolean => {
+  const rel = relative(dir, target);
+  return rel === '' || (rel !== '..' && !rel.startsWith('..' + sep) && !isAbsolute(rel));
+};
+
 /**
- * Resolves a path safely, preventing directory traversal attacks.
- * @param baseDir The base directory.
+ * Resolves a path safely, preventing access outside the root file's directory.
+ * @param fromDir The directory of the file containing the reference.
  * @param filePath The file path to resolve.
+ * @param context The resolution context.
  * @returns The resolved absolute path.
  */
-const resolvePath = (baseDir: string, filePath: string, options: YamlLoaderOptions): string => {
-  const resolved = resolve(baseDir, filePath);
+const resolvePath = (fromDir: string, filePath: string, context: ResolutionContext): string => {
+  const resolved = resolve(fromDir, filePath);
 
-  if (!options.allowExternalAccess && !resolved.startsWith(baseDir)) {
+  if (context.options.allowExternalAccess) {
+    return resolved;
+  }
+
+  let real: string | undefined;
+  try {
+    real = realpathSync(resolved);
+  }
+  catch {
+    // A missing file is reported when it is loaded
+  }
+
+  if (!isWithin(context.rootDir, resolved) || (real !== undefined && !isWithin(context.realRootDir, real))) {
     throw new YamlLoaderError(
       `Attempted to access file outside base directory: ${filePath}`,
-      'invalid_pointer',
+      'access_denied',
       resolved,
+      [...context.pathChain],
     );
   }
 
@@ -176,150 +229,131 @@ const resolvePath = (baseDir: string, filePath: string, options: YamlLoaderOptio
  * @returns An object with filePath and pointer.
  */
 const parseRef = (ref: string): { filePath: string; pointer: string } => {
-  const [filePath, pointer = ''] = ref.split('#');
-  return { filePath, pointer };
+  const hashIndex = ref.indexOf('#');
+  if (hashIndex === -1) {
+    return { filePath: ref, pointer: '' };
+  }
+
+  const fragment = ref.slice(hashIndex + 1);
+  let pointer = fragment;
+  try {
+    pointer = decodeURIComponent(fragment);
+  }
+  catch {
+    // Not valid percent-encoding, use the fragment as is
+  }
+
+  return { filePath: ref.slice(0, hashIndex), pointer };
+};
+
+/**
+ * Runs `fn` with `refKey` on the current resolution path, detecting cycles.
+ */
+const withRef = <T>(refKey: string, context: ResolutionContext, fn: () => T): T => {
+  // Check if this reference is already in the current resolution path (O(1) lookup)
+  if (context.pathSet.has(refKey)) {
+    throw new YamlLoaderError(
+      `Circular reference detected: ${context.pathChain.join(' -> ')} -> ${refKey}`,
+      'circular_ref',
+      refKey,
+      [...context.pathChain, refKey],
+    );
+  }
+
+  context.visited.push(refKey);
+  context.pathChain.push(refKey);
+  context.pathSet.add(refKey);
+
+  try {
+    return fn();
+  }
+  finally {
+    context.pathChain.pop();
+    context.pathSet.delete(refKey);
+  }
 };
 
 /**
  * Recursively resolves all $ref references in an object with generics support.
  * @param obj The object to process.
- * @param baseDir The base directory for resolving relative paths.
+ * @param currentFile The absolute path of the file `obj` came from.
  * @param context The resolution context for tracking state.
- * @param rootDoc The root document for resolving internal references.
+ * @param rootDoc The parsed content of `currentFile`, for resolving internal references.
  * @returns The object with all references resolved.
  */
 const resolveRefs = <T = any>(
   obj: any,
-  baseDir: string,
+  currentFile: string,
   context: ResolutionContext,
-  rootDoc?: any,
+  rootDoc: any,
 ): T => {
   if (obj === null || obj === undefined) {
     return obj;
   }
 
   if (Array.isArray(obj)) {
-    return obj.map(item => resolveRefs(item, baseDir, context, rootDoc)) as T;
+    return obj.map(item => resolveRefs(item, currentFile, context, rootDoc)) as T;
   }
 
   if (typeof obj !== 'object') {
     return obj;
   }
 
-  // Check for custom resolvers first
-  if (obj.$ref && typeof obj.$ref === 'string' && context.options.customResolvers) {
-    for (const [prefix, resolver] of context.options.customResolvers) {
-      if (obj.$ref.startsWith(prefix)) {
-        return resolver(obj.$ref);
-      }
-    }
-  }
-
-  // Check if this object is a $ref reference
   // Note: When $ref is present, the entire object is replaced with the referenced content,
   // and any sibling properties are ignored. This follows the JSON Schema and OpenAPI
   // specifications where $ref takes precedence over all other properties.
-  if (obj.$ref && typeof obj.$ref === 'string') {
-    const { filePath, pointer } = parseRef(obj.$ref);
+  if (typeof obj.$ref === 'string' && obj.$ref) {
+    const ref: string = obj.$ref;
+
+    const siblings = Object.keys(obj).filter(key => key !== '$ref');
+    if (siblings.length > 0) {
+      context.warnings.push(`Properties next to $ref "${ref}" in ${currentFile} are ignored: ${siblings.join(', ')}`);
+    }
+
+    // Check for custom resolvers first
+    for (const [prefix, resolver] of context.options.customResolvers ?? []) {
+      if (ref.startsWith(prefix)) {
+        return withRef(ref, context, () => resolveRefs(resolver(ref), currentFile, context, rootDoc));
+      }
+    }
+
+    const { filePath, pointer } = parseRef(ref);
 
     if (filePath) {
       // External reference to another file
-      const resolvedPath = resolvePath(baseDir, filePath, context.options);
-      const refKey = resolvedPath + '#' + pointer;
+      const resolvedPath = resolvePath(dirname(currentFile), filePath, context);
 
-      // Check if this reference is already in the current resolution path (O(1) lookup)
-      if (context.pathSet.has(refKey)) {
-        throw new YamlLoaderError(
-          `Circular reference detected: ${context.pathChain.join(' -> ')} -> ${refKey}`,
-          'circular_ref',
-          refKey,
-          [...context.pathChain, refKey],
-        );
-      }
-
-      // Add current reference to both the path chain and set
-      context.pathChain.push(refKey);
-      context.pathSet.add(refKey);
-
-      try {
-        // Check if the file is already in the cache
-        let refContent;
-        if (context.fileCache.has(resolvedPath)) {
-          refContent = context.fileCache.get(resolvedPath);
-        }
-        else {
-          try {
-            refContent = loadFile(resolvedPath);
-            context.fileCache.set(resolvedPath, refContent);
-          }
-          catch (error) {
-            throw new YamlLoaderError(
-              `Failed to load file: ${resolvedPath}`,
-              'file_not_found',
-              resolvedPath,
-              context.pathChain,
-            );
-          }
+      return withRef(resolvedPath + '#' + pointer, context, () => {
+        let refContent = context.fileCache.get(resolvedPath);
+        if (refContent === undefined) {
+          refContent = loadFile(resolvedPath, [...context.pathChain]);
+          context.fileCache.set(resolvedPath, refContent);
+          context.loadedFiles.set(resolvedPath, describeValue(refContent));
         }
 
-        const refBaseDir = dirname(resolvedPath);
-        const resolved = resolvePointer(refContent, pointer);
+        const resolved = resolvePointer(refContent, pointer, [...context.pathChain]);
 
-        // Recursively resolve any refs in the referenced content
         // Use the loaded file content as rootDoc for resolving any internal references within the referenced file
-        return resolveRefs(resolved, refBaseDir, context, refContent);
-      }
-      finally {
-        // Clean up: remove from both path chain and set
-        context.pathChain.pop();
-        context.pathSet.delete(refKey);
-      }
+        return resolveRefs(resolved, resolvedPath, context, refContent);
+      });
     }
-    else {
-      // Internal reference within the same file (pointer only, e.g., "#/definitions/User")
-      if (!rootDoc) {
-        // Root document must be available for internal reference resolution
-        throw new YamlLoaderError(
-          `Cannot resolve internal reference "${obj.$ref}": root document not available`,
-          'invalid_pointer',
-          obj.$ref,
-          context.pathChain,
-        );
-      }
 
-      const refKey = '#' + pointer;
-
-      // Check for circular references
-      if (context.pathSet.has(refKey)) {
-        throw new YamlLoaderError(
-          `Circular reference detected: ${context.pathChain.join(' -> ')} -> ${refKey}`,
-          'circular_ref',
-          refKey,
-          [...context.pathChain, refKey],
-        );
-      }
-
-      // Add current reference to both the path chain and set
-      context.pathChain.push(refKey);
-      context.pathSet.add(refKey);
-
-      try {
-        const resolved = resolvePointer(rootDoc, pointer);
-        // Recursively resolve any refs in the resolved content
-        return resolveRefs(resolved, baseDir, context, rootDoc);
-      }
-      finally {
-        // Clean up: remove from both path chain and set
-        context.pathChain.pop();
-        context.pathSet.delete(refKey);
-      }
-    }
+    // Internal reference within the same file (pointer only, e.g., "#/definitions/User")
+    return withRef(currentFile + '#' + pointer, context, () => {
+      const resolved = resolvePointer(rootDoc, pointer, [...context.pathChain]);
+      return resolveRefs(resolved, currentFile, context, rootDoc);
+    });
   }
 
-  // Recursively process all properties
+  // Recursively process all properties. defineProperty keeps "__proto__" keys as plain data.
   const result: any = {};
   for (const [key, value] of Object.entries(obj)) {
-    result[key] = resolveRefs(value, baseDir, context, rootDoc);
+    Object.defineProperty(result, key, {
+      value: resolveRefs(value, currentFile, context, rootDoc),
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
   }
 
   return result;
@@ -327,120 +361,127 @@ const resolveRefs = <T = any>(
 
 /**
  * Creates a resolution context with default options.
+ * @param filename The absolute path of the root file.
  * @param options The loader options.
  * @returns The resolution context.
  */
-const createResolutionContext = (options: YamlLoaderOptions = {}): ResolutionContext => {
+const createResolutionContext = (filename: string, options: YamlLoaderOptions = {}): ResolutionContext => {
+  const rootDir = dirname(filename);
+  let realRootDir = rootDir;
+  try {
+    realRootDir = realpathSync(rootDir);
+  }
+  catch {
+    // The root file's load reports the problem
+  }
+
+  const maxCacheSize = options.maxCacheSize ?? 100;
+
   return {
+    rootDir,
+    realRootDir,
     pathChain: [],
     pathSet: new Set(),
-    fileCache: new LRUFileCache(options.maxCacheSize || 100),
+    visited: [],
+    loadedFiles: new Map(),
+    warnings: [],
+    fileCache: new LRUFileCache(maxCacheSize),
     options: {
-      maxCacheSize: 100,
       allowExternalAccess: false,
       strictMode: false,
-      customResolvers: new Map(),
       ...options,
+      maxCacheSize,
+      customResolvers: options.customResolvers ?? new Map(),
     },
     startTime: Date.now(),
   };
 };
 
 /**
+ * Loads the root file and resolves all of its references.
+ */
+const loadAndResolve = <T>(filename: string, options?: YamlLoaderOptions): { result: T; context: ResolutionContext } => {
+  const absolutePath = resolve(filename);
+  const context = createResolutionContext(absolutePath, options);
+  const content = loadFile(absolutePath, []);
+  context.loadedFiles.set(absolutePath, describeValue(content));
+  context.fileCache.set(absolutePath, content);
+
+  // Pass the content as rootDoc so internal references can be resolved
+  const result = resolveRefs<T>(content, absolutePath, context, content);
+  return { result, context };
+};
+
+/**
+ * Wraps errors that are not YamlLoaderErrors, such as one thrown by a custom resolver.
+ */
+const toLoaderError = (error: unknown, filename: string, prefix: string): YamlLoaderError => {
+  if (error instanceof YamlLoaderError) {
+    return error;
+  }
+  return new YamlLoaderError(
+    `${prefix}: ${error instanceof Error ? error.message : String(error)}`,
+    'parse_error',
+    filename,
+    undefined,
+    error,
+  );
+};
+
+/**
  * Loads and parses a YAML file with generic type support, resolving all $ref references.
- * @param filename The absolute path to the yaml file.
+ * @param filename The path to the yaml file. Relative paths are resolved against the working directory.
  * @param options The loader options.
  * @returns The parsed and resolved content.
  */
 export function loadYaml<T = any>(filename: string, options?: YamlLoaderOptions): T {
-  const context = createResolutionContext(options);
-
   try {
-    const content = loadFile(filename);
-    const baseDir = dirname(filename);
-    // Pass the content as rootDoc so internal references can be resolved
-    return resolveRefs<T>(content, baseDir, context, content);
+    return loadAndResolve<T>(filename, options).result;
   }
   catch (error) {
-    if (error instanceof YamlLoaderError) {
-      throw error;
-    }
-    throw new YamlLoaderError(
-      `Failed to parse YAML file: ${error instanceof Error ? error.message : String(error)}`,
-      'parse_error',
-      filename,
-    );
+    throw toLoaderError(error, filename, 'Failed to parse YAML file');
   }
 }
 
 /**
  * Loads and parses a YAML file with debug information.
- * @param filename The absolute path to the yaml file.
+ * @param filename The path to the yaml file.
  * @param options The loader options.
  * @returns Object containing result and debug information.
  */
 export function loadYamlWithDebug<T = any>(filename: string, options?: YamlLoaderOptions): { result: T; debug: DebugInfo } {
-  const context = createResolutionContext(options);
-
   try {
-    const content = loadFile(filename);
-    const baseDir = dirname(filename);
-    const result = resolveRefs<T>(content, baseDir, context, content);
+    const { result, context } = loadAndResolve<T>(filename, options);
 
     return {
       result,
       debug: {
-        refChain: [...context.pathChain],
-        fileCache: new Map(Array.from(context.fileCache.getCache().entries()).map(([k, v]) => [k, typeof v] as [string, string])),
+        refChain: [...context.visited],
+        fileCache: new Map(context.loadedFiles),
         resolutionTime: Date.now() - context.startTime,
       },
     };
   }
   catch (error) {
-    if (error instanceof YamlLoaderError) {
-      throw error;
-    }
-    throw new YamlLoaderError(
-      `Failed to parse YAML file: ${error instanceof Error ? error.message : String(error)}`,
-      'parse_error',
-      filename,
-    );
+    throw toLoaderError(error, filename, 'Failed to parse YAML file');
   }
 }
 
 /**
- * Validates YAML references without fully resolving them.
- * @param filename The absolute path to the yaml file.
+ * Validates YAML references by resolving them, without throwing.
+ * Resolution stops at the first error, so `errors` holds at most one entry.
+ * `warnings` lists properties that are ignored because they sit next to a `$ref`.
+ * @param filename The path to the yaml file.
  * @param options The loader options.
  * @returns Validation result with errors and warnings.
  */
 export function validateYamlReferences(filename: string, options?: YamlLoaderOptions): ValidationResult {
-  const errors: YamlLoaderError[] = [];
-  const warnings: string[] = [];
-
   try {
-    const context = createResolutionContext(options);
-    const content = loadFile(filename);
-    const baseDir = dirname(filename);
-
-    // Perform a dry run of reference resolution
-    resolveRefs(content, baseDir, context, content);
-
-    return { isValid: true, errors, warnings };
+    const { context } = loadAndResolve(filename, options);
+    return { isValid: true, errors: [], warnings: context.warnings };
   }
   catch (error) {
-    if (error instanceof YamlLoaderError) {
-      errors.push(error);
-    }
-    else {
-      errors.push(new YamlLoaderError(
-        `Unexpected error: ${error instanceof Error ? error.message : String(error)}`,
-        'parse_error',
-        filename,
-      ));
-    }
-
-    return { isValid: false, errors, warnings };
+    return { isValid: false, errors: [toLoaderError(error, filename, 'Unexpected error')], warnings: [] };
   }
 }
 
@@ -455,6 +496,7 @@ export class YamlLoaderBuilder {
     return this;
   }
 
+  /** @deprecated Has no effect. Kept for backward compatibility. */
   withStrictMode(enabled: boolean): this {
     this.options.strictMode = enabled;
     return this;
@@ -474,31 +516,17 @@ export class YamlLoaderBuilder {
   }
 
   build(): (filename: string) => any {
-    return (filename: string) => loadYaml(filename, this.options);
+    return this.buildGeneric();
   }
 
   buildGeneric<T = any>(): (filename: string) => T {
-    return (filename: string) => loadYaml<T>(filename, this.options);
+    // Snapshot the options so later builder calls don't change loaders already built
+    const options: YamlLoaderOptions = {
+      ...this.options,
+      customResolvers: this.options.customResolvers && new Map(this.options.customResolvers),
+    };
+    return (filename: string) => loadYaml<T>(filename, options);
   }
-}
-
-/**
- * Testing utility to access internal LRUFileCache for coverage purposes.
- * This is only for testing and should not be used in production.
- */
-export function getTestCacheInterface(filename: string, options?: YamlLoaderOptions) {
-  const context = createResolutionContext(options);
-
-  // Load the file to initialize the cache
-  loadFile(filename);
-
-  // Return the cache interface for testing
-  return {
-    clear: () => context.fileCache.clear(),
-    size: () => context.fileCache.size(),
-    has: (key: string) => context.fileCache.has(key),
-    getCache: () => context.fileCache.getCache(),
-  };
 }
 
 // Default export for backward compatibility

@@ -1,0 +1,25 @@
+# Requires a current Codex client with named permission-profile support.
+# Mirrors .claude/settings.json and keeps every writable path in the project.
+# Do not combine with sandbox_mode or sandbox_workspace_write settings.
+default_permissions = "yaml-loader"
+approval_policy = "never"
+
+[permissions.yaml-loader]
+description = "Project-only writes; home reads limited to the project and nvm."
+
+[permissions.yaml-loader.filesystem]
+":minimal" = "read"
+"~/.nvm" = "read"
+# Read-only runtime files for this machine's VS Code Codex installation.
+"~/.vscode/extensions" = "read"
+"~/.codex/tmp" = "read"
+
+[permissions.yaml-loader.filesystem.":workspace_roots"]
+"." = "write"
+".git" = "read"
+".agents" = "read"
+".codex" = "read"
+".claude" = "read"
+
+[permissions.yaml-loader.network]
+enabled = false

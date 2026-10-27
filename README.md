@@ -15,7 +15,7 @@ or Yarn:
 ## Table of Contents
 
 - [Overview](#overview)
-- [Installation](#installation)
+- [Install](#install)
 - [Basic Usage](#basic-usage)
 - [Type Safety](#type-safety)
 - [Reference Resolution](#reference-resolution)
@@ -49,7 +49,7 @@ import loadYaml from '@northern/yaml-loader';
 ### Simple YAML Loading
 
 ```typescript
-// Basic usage - returns any type
+// Basic usage - returns any type. Relative paths are resolved against the working directory.
 const config = loadYaml('config.yaml');
 console.log(config.name); // Access properties with basic autocomplete
 ```
@@ -123,7 +123,7 @@ interface User {
 interface UsersConfig {
   users: User[];
   metadata: {
-    created: Date;
+    created: string; // YAML timestamps are parsed as strings
     version: string;
     tags: string[];
   };
@@ -299,23 +299,30 @@ arrayItem:
   $ref: "./data.yaml#/items/1"
 ```
 
+Pointers follow [RFC 6901](https://www.rfc-editor.org/rfc/rfc6901): they must start with `/`, and the fragment may be percent-encoded (`#/a%20b`). A pointer to a key that doesn't exist throws an `invalid_pointer` error.
+
+### Recursive Schemas
+
+References are resolved by inlining, so a structure that refers to itself (for example, a tree node whose `children` refer back to the node) can't be represented and throws a `circular_ref` error.
+
 ## Configuration Options
 
 ### Basic Configuration
 
 ```typescript
-import { YamlLoaderOptions } from './yaml-loader';
+import { YamlLoaderOptions } from '@northern/yaml-loader';
 
 const options: YamlLoaderOptions = {
   maxCacheSize: 50,
-  allowExternalAccess: false,
-  strictMode: true
+  allowExternalAccess: false
 };
 
 const config = loadYaml('config.yaml', options);
 ```
 
 ### Cache Configuration
+
+The cache lives for a single `loadYaml` call and holds parsed files that are referenced more than once.
 
 ```typescript
 // Large cache for enterprise applications
@@ -343,26 +350,16 @@ const openOptions: YamlLoaderOptions = {
 };
 ```
 
-### Strict Mode
+### Strict Mode (deprecated)
 
-```typescript
-// Enable strict validation
-const strictOptions: YamlLoaderOptions = {
-  strictMode: true
-};
-
-// Disable for legacy compatibility
-const lenientOptions: YamlLoaderOptions = {
-  strictMode: false
-};
-```
+`strictMode` and `YamlLoaderBuilder.withStrictMode()` are still accepted but have no effect. Use `validateYamlReferences()` to find problems such as properties ignored next to a `$ref`.
 
 ## Error Handling
 
 ### Basic Error Handling
 
 ```typescript
-import { YamlLoaderError } from './yaml-loader';
+import { YamlLoaderError } from '@northern/yaml-loader';
 
 try {
   const config = loadYaml('config.yaml');
@@ -413,22 +410,36 @@ try {
   }
 }
 
-// Parse error
+// Parse error (in the root file or any referenced file)
 try {
   loadYaml('invalid.yaml');
 } catch (error) {
   if (error instanceof YamlLoaderError && error.type === 'parse_error') {
     console.log('Parse error:', error.message);
+    console.log('Original error:', error.cause);
+  }
+}
+
+// Reference to a file outside the root file's directory
+try {
+  loadYaml('config.yaml');
+} catch (error) {
+  if (error instanceof YamlLoaderError && error.type === 'access_denied') {
+    console.log('Blocked reference to:', error.path);
   }
 }
 ```
 
+Errors thrown by a custom resolver are wrapped in a `parse_error`, with the original error in `cause`.
+
 ### Validation Mode
 
 ```typescript
-import { validateYamlReferences } from './yaml-loader';
+import { validateYamlReferences } from '@northern/yaml-loader';
 
-// Validate without full resolution
+// Resolves everything but returns problems instead of throwing.
+// Resolution stops at the first error, so `errors` holds at most one entry.
+// `warnings` lists properties that are ignored because they sit next to a `$ref`.
 const validation = validateYamlReferences('config.yaml');
 
 if (validation.isValid) {
@@ -467,17 +478,17 @@ const config = loadYaml('main.yaml', options);
 ### Debug Mode
 
 ```typescript
-import { loadYamlWithDebug } from './yaml-loader';
+import { loadYamlWithDebug } from '@northern/yaml-loader';
 
 const { result, debug } = loadYamlWithDebug('complex.yaml');
 
 console.log(`Resolution completed in ${debug.resolutionTime}ms`);
-console.log(`Processed ${debug.refChain.length} references`);
-console.log(`Cached ${debug.fileCache.size} files`);
+console.log(`Resolved ${debug.refChain.length} references`);
+console.log(`Loaded ${debug.fileCache.size} files`);
 
-// Analyze cache contents
-for (const [file, type] of debug.fileCache) {
-  console.log(`${file}: ${type}`);
+// Every file loaded, with the kind of its top-level value ('object', 'array', ...)
+for (const [file, kind] of debug.fileCache) {
+  console.log(`${file}: ${kind}`);
 }
 ```
 
@@ -491,7 +502,7 @@ function loadWithMetrics<T = any>(filename: string): T {
   const duration = Date.now() - start;
   
   console.log(`Load time: ${duration}ms`);
-  console.log(`Cache hits: ${debug.fileCache.size}`);
+  console.log(`Files loaded: ${debug.fileCache.size}`);
   console.log(`References resolved: ${debug.refChain.length}`);
   
   return result;
@@ -504,10 +515,13 @@ const config = loadWithMetrics('config.yaml');
 
 ### Directory Traversal Protection
 
+By default, every `$ref` must point inside the directory that contains the root file passed to `loadYaml`. Referenced files can use `../` as long as the target stays inside that directory. Symlinks are followed before the check, so a link can't be used to escape it.
+
 ```typescript
-// Default: prevents access outside base directory
-const secureConfig = loadYaml('config.yaml');
-// This will fail if config.yaml contains: $ref: "../secret.yaml"
+// Default: prevents access outside the root file's directory
+const secureConfig = loadYaml('specs/api.yaml');
+// Allowed in specs/paths/users.yaml: $ref: "../schemas/user.yaml"
+// Fails with an 'access_denied' error:  $ref: "../../secret.yaml"
 ```
 
 ### Allow External Access
@@ -522,25 +536,17 @@ const config = loadYaml('config.yaml', options);
 // Now allows: $ref: "../shared/config.yaml"
 ```
 
-### Path Validation
+### Handling Denied Access
 
 ```typescript
-// Custom path validation
-function loadWithValidation(filename: string, allowedPaths: string[]) {
-  try {
-    return loadYaml(filename, { allowExternalAccess: true });
-  } catch (error) {
-    if (error instanceof YamlLoaderError && error.type === 'file_not_found') {
-      // Check if path is in allowed list
-      const isAllowed = allowedPaths.some(path => 
-        error.path?.includes(path)
-      );
-      if (!isAllowed) {
-        throw new Error('Access denied to external file');
-      }
-    }
-    throw error;
+try {
+  loadYaml('config.yaml');
+} catch (error) {
+  if (error instanceof YamlLoaderError && error.type === 'access_denied') {
+    console.error(`Reference outside the project: ${error.path}`);
+    console.error('Via:', error.refChain?.join(' -> '));
   }
+  throw error;
 }
 ```
 
@@ -549,12 +555,11 @@ function loadWithValidation(filename: string, allowedPaths: string[]) {
 ### Builder Pattern
 
 ```typescript
-import { YamlLoaderBuilder } from './yaml-loader';
+import { YamlLoaderBuilder } from '@northern/yaml-loader';
 
 // Simple builder
 const loader = new YamlLoaderBuilder()
   .withCache(50)
-  .withStrictMode(true)
   .withExternalAccess(false)
   .build();
 
@@ -576,8 +581,10 @@ const appConfig = typedLoader('app.yaml');
 
 ### Custom Resolvers
 
+A custom resolver handles every `$ref` that starts with its prefix, and is checked before file references. Its return value replaces the `$ref` object, and any `$ref`s inside that value are resolved too.
+
 ```typescript
-import { YamlLoaderBuilder } from './yaml-loader';
+import { YamlLoaderBuilder } from '@northern/yaml-loader';
 
 // Environment variable resolver
 const loader = new YamlLoaderBuilder()
@@ -587,34 +594,36 @@ const loader = new YamlLoaderBuilder()
   })
   .build();
 
-// Usage in YAML:
-# config.yaml
-database:
-  url: env:DATABASE_URL
-  password: env:DB_PASSWORD
-
 const config = loader('config.yaml');
 // config.database.url will contain the environment variable value
 ```
 
-### HTTP Resolver
+```yaml
+# config.yaml
+database:
+  url:
+    $ref: "env:DATABASE_URL"
+  password:
+    $ref: "env:DB_PASSWORD"
+```
+
+### Remote Resolvers
+
+Resolvers must be synchronous: a resolver that returns a Promise puts the Promise itself into the result. To use remote schemas, fetch them first and serve them from memory:
 
 ```typescript
-import axios from 'axios';
+const urls = ['https://example.com/schemas/user.json'];
+const remote = new Map<string, unknown>();
+for (const url of urls) {
+  remote.set(url, await (await fetch(url)).json());
+}
 
-// HTTP-based resolver for remote schemas
 const httpLoader = new YamlLoaderBuilder()
-  .withCustomResolver('http:', async (ref) => {
-    const response = await axios.get(ref);
-    return response.data;
-  })
-  .withCustomResolver('https:', async (ref) => {
-    const response = await axios.get(ref);
-    return response.data;
-  })
+  .withCustomResolver('https:', (ref) => remote.get(ref))
   .build();
+```
 
-// Usage in YAML:
+```yaml
 # config.yaml
 schema:
   $ref: "https://example.com/schemas/user.json"
@@ -640,8 +649,9 @@ const templateLoader = new YamlLoaderBuilder()
     return templates[templateName];
   })
   .build();
+```
 
-// Usage in YAML:
+```yaml
 # config.yaml
 userService:
   $ref: "template:user-service"
@@ -655,8 +665,7 @@ authService:
 function loadConfig(configPath: string, isProduction: boolean) {
   const options: YamlLoaderOptions = {
     maxCacheSize: isProduction ? 500 : 50,
-    allowExternalAccess: !isProduction,
-    strictMode: isProduction
+    allowExternalAccess: !isProduction
   };
   
   return loadYaml(configPath, options);
@@ -713,7 +722,7 @@ const loader = new ExtensibleYamlLoader()
 Loads and parses a YAML file with reference resolution.
 
 **Parameters:**
-- `filename: string` - Absolute path to the YAML/JSON file
+- `filename: string` - Path to the YAML/JSON file (relative paths are resolved against the working directory)
 - `options?: YamlLoaderOptions` - Configuration options (optional)
 
 **Returns:**
@@ -734,12 +743,12 @@ Loads YAML with debug information for troubleshooting.
 
 #### `validateYamlReferences(filename: string, options?: YamlLoaderOptions): ValidationResult`
 
-Validates references without full resolution.
+Resolves all references and reports problems instead of throwing.
 
 **Returns:**
 - `isValid: boolean` - Whether all references are valid
-- `errors: YamlLoaderError[]` - List of validation errors
-- `warnings: string[]` - List of warnings
+- `errors: YamlLoaderError[]` - The first error found (resolution stops there)
+- `warnings: string[]` - Properties ignored because they sit next to a `$ref`
 
 ### Classes
 
@@ -749,20 +758,23 @@ Builder pattern for creating configured loaders.
 
 **Methods:**
 - `withCache(size: number): this` - Set cache size
-- `withStrictMode(enabled: boolean): this` - Enable/disable strict mode
+- `withStrictMode(enabled: boolean): this` - Deprecated, has no effect
 - `withExternalAccess(enabled: boolean): this` - Allow/deny external access
 - `withCustomResolver(prefix: string, resolver: (ref: string) => any): this` - Add custom resolver
 - `build(): (filename: string) => any` - Build configured loader
 - `buildGeneric<T>(): (filename: string) => T` - Build typed loader
+
+Each built loader keeps the options it was built with. Later builder calls don't change it.
 
 #### `YamlLoaderError`
 
 Enhanced error class for YAML loading issues.
 
 **Properties:**
-- `type: 'circular_ref' | 'file_not_found' | 'invalid_pointer' | 'parse_error'` - Error category
+- `type: YamlLoaderErrorType` - Error category: `'circular_ref' | 'file_not_found' | 'invalid_pointer' | 'parse_error' | 'access_denied'`
 - `path?: string` - File path or reference path
 - `refChain?: string[]` - Chain of references that led to the error
+- `cause?: unknown` - The underlying error, if any (for example, the YAML parser's error)
 
 ### Interfaces
 
@@ -773,9 +785,9 @@ Configuration options for YAML loading.
 ```typescript
 interface YamlLoaderOptions {
   maxCacheSize?: number;        // Maximum files to cache (default: 100)
-  allowExternalAccess?: boolean; // Allow directory traversal (default: false)
-  customResolvers?: Map<string, (ref: string) => any>; // Custom resolvers
-  strictMode?: boolean;         // Enable strict validation (default: false)
+  allowExternalAccess?: boolean; // Allow refs outside the root file's directory (default: false)
+  customResolvers?: Map<string, (ref: string) => any>; // Synchronous custom resolvers
+  strictMode?: boolean;         // Deprecated, has no effect
 }
 ```
 
@@ -785,8 +797,8 @@ Debug information from `loadYamlWithDebug`.
 
 ```typescript
 interface DebugInfo {
-  refChain: string[];                    // Reference resolution chain
-  fileCache: Map<string, string>;        // Cached files and their types
+  refChain: string[];                    // Every reference resolved, in order
+  fileCache: Map<string, string>;        // Files loaded and the kind of their top-level value
   resolutionTime: number;                 // Time in milliseconds
 }
 ```
@@ -797,13 +809,13 @@ interface DebugInfo {
 
 **Before:**
 ```typescript
-const yamlLoader = require('./yaml-loader');
+const yamlLoader = require('@northern/yaml-loader').default;
 const config = yamlLoader('config.yaml');
 ```
 
 **After:**
 ```typescript
-import { loadYaml } from './yaml-loader';
+import { loadYaml } from '@northern/yaml-loader';
 const config = loadYaml('config.yaml');
 ```
 
@@ -837,8 +849,7 @@ const config = loadYaml('config.yaml');
 ```typescript
 const config = loadYaml('config.yaml', {
   maxCacheSize: 50,
-  allowExternalAccess: true,
-  strictMode: false
+  allowExternalAccess: true
 });
 ```
 
@@ -853,7 +864,6 @@ const config = loadYaml('config.yaml');
 ```typescript
 const loader = new YamlLoaderBuilder()
   .withCache(50)
-  .withStrictMode(true)
   .build();
 
 const config = loader('config.yaml');
@@ -870,7 +880,7 @@ const config = loader('config.yaml');
 **Solution:**
 - Check reference chains in YAML files
 - Use `validateYamlReferences()` to detect issues early
-- Consider restructuring to avoid circular dependencies
+- Consider restructuring to avoid circular dependencies (recursive schemas can't be inlined; see [Recursive Schemas](#recursive-schemas))
 
 #### File Not Found
 
@@ -878,8 +888,16 @@ const config = loader('config.yaml');
 
 **Solutions:**
 - Verify file paths are correct
-- Check if `allowExternalAccess: true` is needed for external files
-- Use absolute paths for reliable resolution
+- `$ref` paths are relative to the file that contains them
+- Relative root paths passed to `loadYaml` are resolved against the working directory
+
+#### Access Denied
+
+**Error:** `Attempted to access file outside base directory: ../shared.yaml`
+
+**Solutions:**
+- Move shared files inside the root file's directory
+- Set `allowExternalAccess: true` for trusted inputs
 
 #### Type Errors
 
@@ -990,15 +1008,15 @@ api:
     $ref: "./schemas/all.yaml"
 ```
 
-#### Lazy Loading
+#### Loading a Section
+
+`loadYaml` takes a file path, not a `$ref`, so it always loads the whole file. To work with a single section, reference it with a pointer from a small entry file:
+
+```yaml
+# user-service.yaml
+$ref: "./config.yaml#/services/user"
+```
 
 ```typescript
-// Load only what you need
-function loadSection<T>(filename: string, pointer: string): T {
-  const fullPath = `${filename}#${pointer}`;
-  return loadYaml<T>(fullPath);
-}
-
-const userConfig = loadSection('config.yaml', '#/services/user');
-const dbConfig = loadSection('config.yaml', '#/database');
+const userConfig = loadYaml('user-service.yaml');
 ```
