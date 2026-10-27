@@ -4,22 +4,22 @@ import { parse } from 'yaml';
 
 // Type definitions
 export interface YamlLoaderOptions {
-  /** Maximum number of parsed files kept in memory during a single load (default: 100). */
+  // Maximum number of parsed files kept in memory during a single load (default: 100).
   maxCacheSize?: number;
-  /** Allow `$ref`s to files outside the directory of the root file (default: false). */
+  // Allow `$ref`s to files outside the directory of the root file (default: false).
   allowExternalAccess?: boolean;
-  /** Synchronous resolvers keyed by `$ref` prefix, e.g. `env:`. */
+  // Synchronous resolvers keyed by `$ref` prefix, e.g. `env:`.
   customResolvers?: Map<string, (ref: string) => any>;
-  /** @deprecated Has no effect. Kept for backward compatibility. */
+  // @deprecated Has no effect. Kept for backward compatibility.
   strictMode?: boolean;
 }
 
 export interface DebugInfo {
-  /** Every reference resolved during the load, in resolution order. */
+  // Every reference resolved during the load, in resolution order.
   refChain: string[];
-  /** Files that were loaded, mapped to the kind of their top-level value. */
+  // Files that were loaded, mapped to the kind of their top-level value.
   fileCache: Map<string, string>;
-  /** Total time in milliseconds. */
+  // Total time in milliseconds.
   resolutionTime: number;
 }
 
